@@ -146,7 +146,10 @@ export class OneBotClient extends EventEmitter {
     socket.on("message", (data) => this.handleSocketMessage(data));
     socket.on("close", () => {
       if (this.ws === socket) this.ws = null;
-      if (!this.stopped) this.logger.warn?.("[onebot-hook] WebSocket closed");
+      if (!this.stopped) {
+        this.logger.warn?.("[onebot-hook] WebSocket closed");
+        this.emit("close");
+      }
     });
     socket.on("error", (error) => this.logger.error?.(`[onebot-hook] WebSocket error: ${error.message}`));
   }
@@ -249,4 +252,3 @@ export class MessageDeduper {
 export function isOkResponse(response: OneBotApiResponse): boolean {
   return response.status === undefined || response.status === "ok" || response.retcode === 0;
 }
-
