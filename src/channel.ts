@@ -1,6 +1,7 @@
 import { getOneBotHookConfig, listAccountIds } from "./config.js";
-import { sendTextToCapturedTarget } from "./outbound.js";
+import { normalizeOutboundImageSource, sendOneBotMessageToCapturedTarget, sendTextToCapturedTarget } from "./outbound.js";
 import { OneBotClient } from "./onebot-client.js";
+import type { OneBotMessageSegment } from "./types.js";
 
 function parseTarget(to: string): { kind: "private" | "group"; id: number } | null {
   const normalized = to.replace(/^(onebot|qq|lagrange):/i, "").trim().toLowerCase();
@@ -26,7 +27,7 @@ export const OneBotHookChannelPlugin = {
   },
   capabilities: {
     chatTypes: ["direct", "group"] as const,
-    media: false,
+    media: true,
     reactions: false,
     threads: false,
     polls: false,
@@ -66,6 +67,44 @@ export const OneBotHookChannelPlugin = {
         await client.stop().catch(() => undefined);
       }
     },
+    sendMedia: async ({
+      to,
+      text,
+      caption,
+      mediaUrl,
+      mediaUrls,
+      accountId,
+      cfg,
+    }: {
+      to: string;
+      text?: string;
+      caption?: string;
+      mediaUrl?: string;
+      mediaUrls?: string[];
+      accountId?: string;
+      cfg?: any;
+    }) => {
+      const target = parseTarget(to);
+      if (!target) return { channel: "onebot", ok: false, messageId: "", error: new Error(`Invalid target: ${to}`) };
+      const config = getOneBotHookConfig(cfg ?? (globalThis as any).__onebotHookApi, accountId);
+      if (!config) return { channel: "onebot", ok: false, messageId: "", error: new Error("OneBot is not configured") };
+      const urls = [...(mediaUrl ? [mediaUrl] : []), ...(Array.isArray(mediaUrls) ? mediaUrls : [])]
+        .map((url) => normalizeOutboundImageSource(url))
+        .filter((url): url is string => Boolean(url));
+      if (urls.length === 0) return { channel: "onebot", ok: false, messageId: "", error: new Error("OneBot media send requires mediaUrl") };
+      const segments: OneBotMessageSegment[] = [];
+      const messageText = text ?? caption;
+      if (messageText?.trim()) segments.push({ type: "text", data: { text: messageText.trim() } });
+      for (const url of urls) segments.push({ type: "image", data: { file: url } });
+      const client = new OneBotClient(config);
+      try {
+        const messageId = await sendOneBotMessageToCapturedTarget(client, config, target, segments, {});
+        return { channel: "onebot", ok: true, messageId };
+      } catch (error) {
+        return { channel: "onebot", ok: false, messageId: "", error: error instanceof Error ? error : new Error(String(error)) };
+      } finally {
+        await client.stop().catch(() => undefined);
+      }
+    },
   },
 };
-

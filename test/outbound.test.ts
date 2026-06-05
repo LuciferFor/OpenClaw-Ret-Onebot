@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { ReplyChunkSender, sendTextToCapturedTarget } from "../src/outbound.js";
-import type { CapturedReplyTarget, OneBotHookConfig } from "../src/types.js";
+import { ReplyChunkSender, sendOneBotMessageToCapturedTarget, sendTextToCapturedTarget } from "../src/outbound.js";
+import type { CapturedReplyTarget, OneBotHookConfig, OneBotOutgoingMessage } from "../src/types.js";
 import type { OneBotClient } from "../src/onebot-client.js";
 
 function config(overrides: Partial<OneBotHookConfig["reply"]> = {}): OneBotHookConfig {
@@ -18,6 +18,17 @@ function config(overrides: Partial<OneBotHookConfig["reply"]> = {}): OneBotHookC
       markdownToPlain: true,
       maxRetries: 3,
       ...overrides,
+    },
+    media: {
+      enabled: true,
+      downloadInboundImages: true,
+      cacheDir: "~/.openclaw/media/onebot",
+      maxImageBytes: 15_000_000,
+      downloadTimeoutMs: 10_000,
+      retainHours: 24,
+      outboundMode: "segments",
+      markdownImages: true,
+      maxImagesPerReply: 6,
     },
   };
 }
@@ -72,6 +83,86 @@ describe("ReplyChunkSender", () => {
     await sender.deliver("**bold** and `code`", { kind: "final" });
     expect(sends).toEqual(["bold and code"]);
   });
+
+  it("sends markdown images as ordered OneBot segments", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliver("hello ![pic](https://example.test/a.png) world", { kind: "final" });
+
+    expect(sends).toEqual([
+      [
+        { type: "text", data: { text: "hello" } },
+        { type: "image", data: { file: "https://example.test/a.png", summary: "pic" } },
+        { type: "text", data: { text: "world" } },
+      ],
+    ]);
+  });
+
+  it("sends mediaUrl payloads as mixed text and image segments", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliver({ text: "caption", mediaUrls: ["https://example.test/a.png", "https://example.test/b.png"] }, { kind: "final" });
+
+    expect(sends).toEqual([
+      [
+        { type: "text", data: { text: "caption" } },
+        { type: "image", data: { file: "https://example.test/a.png" } },
+        { type: "image", data: { file: "https://example.test/b.png" } },
+      ],
+    ]);
+  });
+
+  it("can send a configured fallback when the model returns NO_REPLY", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      },
+      {},
+      { noReplyFallback: "嗯？" }
+    );
+
+    await sender.deliver("NO_REPLY", { kind: "final" });
+    await sender.finish();
+
+    expect(sends).toEqual(["嗯？"]);
+  });
+
+  it("does not send a fallback for NO_REPLY unless one is configured", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliver("NO_REPLY", { kind: "final" });
+    await sender.finish();
+
+    expect(sends).toEqual([]);
+  });
 });
 
 describe("sendTextToCapturedTarget", () => {
@@ -97,5 +188,20 @@ describe("sendTextToCapturedTarget", () => {
     expect(messageId).toBe("88");
     expect(sendGroupMsg).toHaveBeenCalledWith(90001, "hello group");
   });
-});
 
+  it("retries and sends image segment arrays", async () => {
+    const target: CapturedReplyTarget = { kind: "private", id: 10001 };
+    const message: OneBotOutgoingMessage = [{ type: "image", data: { file: "https://example.test/a.png" } }];
+    const sendPrivateMsg = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "failed", retcode: 100, wording: "bad gateway" })
+      .mockResolvedValueOnce({ status: "ok", retcode: 0, data: { message_id: 99 } });
+    const client = { sendPrivateMsg } as unknown as OneBotClient;
+
+    const messageId = await sendOneBotMessageToCapturedTarget(client, config({ maxRetries: 2 }), target, message);
+
+    expect(messageId).toBe("99");
+    expect(sendPrivateMsg).toHaveBeenCalledTimes(2);
+    expect(sendPrivateMsg).toHaveBeenCalledWith(10001, message);
+  });
+});

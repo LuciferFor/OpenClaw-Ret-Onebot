@@ -1,4 +1,4 @@
-import type { OneBotHookConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
+import type { OneBotHookConfig, OneBotMediaConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
 
 const DEFAULT_WS_PATH = "/onebot/v11/ws";
 
@@ -46,6 +46,20 @@ function normalizeReplyConfig(raw: any): OneBotReplyConfig {
   };
 }
 
+function normalizeMediaConfig(raw: any): OneBotMediaConfig {
+  return {
+    enabled: raw?.enabled === undefined ? true : Boolean(raw.enabled),
+    downloadInboundImages: raw?.downloadInboundImages === undefined ? true : Boolean(raw.downloadInboundImages),
+    cacheDir: asString(raw?.cacheDir) ?? "~/.openclaw/media/onebot",
+    maxImageBytes: asNumber(raw?.maxImageBytes, 15_000_000, 1, 100_000_000),
+    downloadTimeoutMs: asNumber(raw?.downloadTimeoutMs, 10_000, 100, 60_000),
+    retainHours: asNumber(raw?.retainHours, 24, 1, 24 * 30),
+    outboundMode: "segments",
+    markdownImages: raw?.markdownImages === undefined ? true : Boolean(raw.markdownImages),
+    maxImagesPerReply: asNumber(raw?.maxImagesPerReply, 6, 0, 50),
+  };
+}
+
 export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): OneBotHookConfig | null {
   const root = apiOrConfig?.config ?? apiOrConfig ?? {};
   const channel = root?.channels?.onebot;
@@ -64,6 +78,7 @@ export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): On
     allowFrom: asStringArray(raw.allowFrom).map(normalizePeerRef),
     denyFrom: asStringArray(raw.denyFrom).map(normalizePeerRef),
     reply: normalizeReplyConfig(raw.reply),
+    media: normalizeMediaConfig(raw.media),
   };
 }
 
@@ -93,4 +108,3 @@ export function isAllowedByPeerLists(config: OneBotHookConfig, userId: number | 
   if (config.allowFrom.length === 0) return true;
   return refs.some((ref) => config.allowFrom.includes(ref));
 }
-

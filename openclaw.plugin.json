@@ -129,6 +129,50 @@
               }
             },
             "description": "Reliable reply delivery settings."
+          },
+          "media": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "downloadInboundImages": {
+                "type": "boolean",
+                "default": true
+              },
+              "cacheDir": {
+                "type": "string",
+                "default": "~/.openclaw/media/onebot"
+              },
+              "maxImageBytes": {
+                "type": "number",
+                "default": 15000000
+              },
+              "downloadTimeoutMs": {
+                "type": "number",
+                "default": 10000
+              },
+              "retainHours": {
+                "type": "number",
+                "default": 24
+              },
+              "outboundMode": {
+                "type": "string",
+                "enum": ["segments"],
+                "default": "segments"
+              },
+              "markdownImages": {
+                "type": "boolean",
+                "default": true
+              },
+              "maxImagesPerReply": {
+                "type": "number",
+                "default": 6
+              }
+            },
+            "description": "Inbound image caching and outbound OneBot media segment settings."
           }
         }
       },

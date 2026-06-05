@@ -49,13 +49,24 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
         "flushChars": 160,
         "markdownToPlain": true,
         "maxRetries": 3
+      },
+      "media": {
+        "enabled": true,
+        "downloadInboundImages": true,
+        "cacheDir": "~/.openclaw/media/onebot",
+        "maxImageBytes": 15000000,
+        "downloadTimeoutMs": 10000,
+        "retainHours": 24,
+        "outboundMode": "segments",
+        "markdownImages": true,
+        "maxImagesPerReply": 6
       }
     }
   }
 }
 ```
 
-Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present.
+Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present. Image + text messages preserve their OneBot segment order; inbound images are cached locally when possible and outbound images are sent as OneBot `image` segments.
 
 ## Verify
 

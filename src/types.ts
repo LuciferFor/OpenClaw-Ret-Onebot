@@ -23,6 +23,18 @@ export interface OneBotReplyConfig {
   maxRetries: number;
 }
 
+export interface OneBotMediaConfig {
+  enabled: boolean;
+  downloadInboundImages: boolean;
+  cacheDir: string;
+  maxImageBytes: number;
+  downloadTimeoutMs: number;
+  retainHours: number;
+  outboundMode: "segments";
+  markdownImages: boolean;
+  maxImagesPerReply: number;
+}
+
 export interface OneBotHookConfig {
   enabled: boolean;
   accountId: string;
@@ -33,6 +45,7 @@ export interface OneBotHookConfig {
   allowFrom: string[];
   denyFrom: string[];
   reply: OneBotReplyConfig;
+  media: OneBotMediaConfig;
 }
 
 export interface OneBotSenderInfo {
@@ -45,6 +58,48 @@ export interface OneBotMessageSegment {
   type: string;
   data?: Record<string, unknown>;
 }
+
+export type OneBotOutgoingMessage = string | OneBotMessageSegment[];
+
+export type InboundMediaKind = "image" | "record" | "video" | "file";
+
+export interface InboundTextPart {
+  kind: "text";
+  text: string;
+}
+
+export interface InboundMentionPart {
+  kind: "mention";
+  qq: string;
+  text: string;
+  self: boolean;
+}
+
+export interface InboundMediaPart {
+  kind: InboundMediaKind;
+  segmentType: string;
+  data: Record<string, unknown>;
+  file?: string;
+  url?: string;
+  source?: string;
+  summary?: string;
+  filename?: string;
+  mime?: string;
+  size?: number;
+  localPath?: string;
+  localFileUri?: string;
+  downloadStatus?: "saved" | "skipped" | "failed";
+  downloadError?: string;
+}
+
+export interface InboundUnknownPart {
+  kind: "unknown";
+  segmentType: string;
+  data: Record<string, unknown>;
+  text: string;
+}
+
+export type InboundMessagePart = InboundTextPart | InboundMentionPart | InboundMediaPart | InboundUnknownPart;
 
 export interface OneBotMessageEvent {
   time?: number;
@@ -79,6 +134,14 @@ export interface OneBotSendData {
   message_id?: number | string;
 }
 
+export interface OneBotImageData {
+  file?: string;
+  url?: string;
+  path?: string;
+  filename?: string;
+  [key: string]: unknown;
+}
+
 export interface LoggerLike {
   debug?: (message: string) => void;
   info?: (message: string) => void;
@@ -99,4 +162,3 @@ export interface OpenClawPluginApi {
   }) => void;
   registerTool?: never;
 }
-

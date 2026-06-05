@@ -5,7 +5,9 @@ import type {
   LoggerLike,
   OneBotApiResponse,
   OneBotHookConfig,
+  OneBotImageData,
   OneBotMessageEvent,
+  OneBotOutgoingMessage,
   OneBotSendData,
 } from "./types.js";
 
@@ -60,7 +62,7 @@ export class OneBotClient extends EventEmitter {
     }
   }
 
-  async sendPrivateMsg(userId: number, message: string): Promise<OneBotApiResponse<OneBotSendData>> {
+  async sendPrivateMsg(userId: number, message: OneBotOutgoingMessage): Promise<OneBotApiResponse<OneBotSendData>> {
     return this.callApi<OneBotSendData>("send_private_msg", {
       user_id: userId,
       message,
@@ -68,12 +70,16 @@ export class OneBotClient extends EventEmitter {
     });
   }
 
-  async sendGroupMsg(groupId: number, message: string): Promise<OneBotApiResponse<OneBotSendData>> {
+  async sendGroupMsg(groupId: number, message: OneBotOutgoingMessage): Promise<OneBotApiResponse<OneBotSendData>> {
     return this.callApi<OneBotSendData>("send_group_msg", {
       group_id: groupId,
       message,
       auto_escape: false,
     });
+  }
+
+  async getImage(file: string): Promise<OneBotApiResponse<OneBotImageData>> {
+    return this.callApi<OneBotImageData>("get_image", { file });
   }
 
   async callApi<T = unknown>(action: string, params: Record<string, unknown>): Promise<OneBotApiResponse<T>> {

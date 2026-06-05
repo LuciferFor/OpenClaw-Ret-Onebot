@@ -1,19 +1,34 @@
 import { isAllowedByPeerLists } from "./config.js";
-import { OneBotClient } from "./onebot-client.js";
-import { ReplyChunkSender, sendTextToCapturedTarget } from "./outbound.js";
+import {
+  buildAgentMediaPayloadFromParts,
+  buildOpenClawContent,
+  extractInboundParts,
+  partsHaveMedia,
+  partsToText,
+  prepareInboundMediaParts,
+  summarizeMediaParts,
+} from "./media.js";
+import { isOkResponse, OneBotClient } from "./onebot-client.js";
+import { ReplyChunkSender, sendOneBotMessageToCapturedTarget } from "./outbound.js";
 import type {
   CapturedReplyTarget,
+  InboundMessagePart,
   LoggerLike,
   OneBotHookConfig,
   OneBotMessageEvent,
-  OneBotMessageSegment,
   OpenClawPluginApi,
 } from "./types.js";
+
+const MENTION_ONLY_PROMPT = "对方在群里直接 @ 了你，没有附加文字。请简短回应对方。";
+const MENTION_ONLY_FALLBACK_REPLY = "嗯？";
 
 export interface InboundDecision {
   forward: boolean;
   reason: string;
   text: string;
+  promptText: string;
+  hasMedia: boolean;
+  parts: InboundMessagePart[];
   target?: CapturedReplyTarget;
 }
 
@@ -27,31 +42,43 @@ export function decideInbound(config: OneBotHookConfig, message: OneBotMessageEv
   const userId = numberValue(message.user_id);
   const groupId = numberValue(message.group_id);
 
-  if (userId == null) return { forward: false, reason: "missing-user-id", text: "" };
-  if (selfId != null && userId === selfId) return { forward: false, reason: "self-message", text: "" };
-  if (!isAllowedByPeerLists(config, userId, groupId)) return { forward: false, reason: "peer-filtered", text: "" };
+  const emptyParts: InboundMessagePart[] = [];
+  if (userId == null) return { forward: false, reason: "missing-user-id", text: "", promptText: "", hasMedia: false, parts: emptyParts };
+  if (selfId != null && userId === selfId) return { forward: false, reason: "self-message", text: "", promptText: "", hasMedia: false, parts: emptyParts };
+  if (!isAllowedByPeerLists(config, userId, groupId)) {
+    return { forward: false, reason: "peer-filtered", text: "", promptText: "", hasMedia: false, parts: emptyParts };
+  }
 
   const isGroup = message.message_type === "group";
   const target: CapturedReplyTarget | undefined = isGroup && groupId != null
     ? { kind: "group", id: groupId }
     : { kind: "private", id: userId };
-  if (!target) return { forward: false, reason: "missing-target", text: "" };
+  if (!target) return { forward: false, reason: "missing-target", text: "", promptText: "", hasMedia: false, parts: emptyParts };
 
   const mentioned = isMentioned(message, selfId);
-  const text = extractMessageText(message, {
+  let parts = extractInboundParts(message, {
     stripMention: config.trigger.stripMention,
     selfId,
-  }).trim();
-  if (!text) return { forward: false, reason: "empty-text", text: "" };
+  });
+  let text = partsToText(parts, { includeMedia: false }).trim();
+  let promptText = partsToText(parts, { includeMedia: true }).trim();
+  let hasMedia = partsHaveMedia(parts);
+  if (isGroup && mentioned && !text && !hasMedia) {
+    parts = [{ kind: "text", text: MENTION_ONLY_PROMPT }];
+    text = MENTION_ONLY_PROMPT;
+    promptText = MENTION_ONLY_PROMPT;
+    hasMedia = false;
+  }
+  if (!text && !hasMedia) return { forward: false, reason: "empty-text", text: "", promptText: "", hasMedia: false, parts };
 
-  if (!isGroup) return { forward: true, reason: "private", text, target };
+  if (!isGroup) return { forward: true, reason: "private", text, promptText, hasMedia, parts, target };
 
   const keywordMatched = config.trigger.keywords.some((keyword) => keyword && text.toLowerCase().includes(keyword.toLowerCase()));
   if (!mentioned && !keywordMatched) {
-    return { forward: false, reason: "group-not-triggered", text, target };
+    return { forward: false, reason: "group-not-triggered", text, promptText, hasMedia, parts, target };
   }
 
-  return { forward: true, reason: mentioned ? "group-mentioned" : "group-keyword", text, target };
+  return { forward: true, reason: mentioned ? "group-mentioned" : "group-keyword", text, promptText, hasMedia, parts, target };
 }
 
 export async function processInboundMessage(
@@ -82,19 +109,36 @@ export async function processInboundMessage(
   const senderLabel = formatSenderLabel(message);
   const chatType = target.kind === "group" ? "group" : "direct";
   const replyTo = target.kind === "group" ? `group:${target.id}` : `user:${target.id}`;
+  const preparedParts = await prepareInboundMediaParts(decision.parts, config, logger, async (file, part) => {
+    if (typeof (client as any).getImage !== "function") return undefined;
+    const response = await (client as any).getImage(file);
+    if (!response || !isOkResponse(response)) {
+      throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+    }
+    return response?.data ?? { file: part.file };
+  });
+  const content = buildOpenClawContent(preparedParts);
+  const mediaPayload = buildAgentMediaPayloadFromParts(preparedParts);
+  const promptText = partsToText(preparedParts, { includeMedia: true }) || decision.promptText || decision.text;
 
-  const body = runtime?.channel?.reply?.formatInboundEnvelope?.({
+  const formattedBody = runtime?.channel?.reply?.formatInboundEnvelope?.({
     channel: "OneBot",
     from: senderLabel,
     timestamp: Date.now(),
-    body: decision.text,
+    body: promptText,
+    content,
+    mediaParts: summarizeMediaParts(preparedParts),
     chatType,
     sender: { name: senderLabel, id: String(message.user_id) },
-  }) ?? { content: [{ type: "text", text: decision.text }] };
+  });
+  const body = mergeInboundBody(formattedBody, content);
 
-  const ctxPayload = {
+  const baseCtxPayload = {
     Body: body,
-    RawBody: decision.text,
+    BodyForAgent: promptText,
+    CommandBody: decision.text,
+    BodyForCommands: decision.text,
+    RawBody: promptText,
     From: target.kind === "group" ? `onebot:group:${target.id}` : `onebot:user:${target.id}`,
     To: `onebot:${replyTo}`,
     SessionKey: sessionKey,
@@ -121,16 +165,23 @@ export async function processInboundMessage(
       userId: message.user_id,
       groupId: message.group_id,
       selfId: message.self_id,
+      parts: preparedParts,
+      mediaParts: summarizeMediaParts(preparedParts),
     },
+    ...mediaPayload,
   };
+  const ctxPayload = finalizeInboundContextIfAvailable(runtime, baseCtxPayload, logger);
 
   await recordInboundSessionIfAvailable(api, sessionKey, ctxPayload, config, target, logger);
 
   const chunkSender = new ReplyChunkSender(
     config,
     target,
-    (captured, text) => sendTextToCapturedTarget(client, config, captured, text, logger),
-    logger
+    (captured, message) => sendOneBotMessageToCapturedTarget(client, config, captured, message, logger),
+    logger,
+    decision.reason === "group-mentioned" && decision.text === MENTION_ONLY_PROMPT
+      ? { noReplyFallback: MENTION_ONLY_FALLBACK_REPLY }
+      : {}
   );
 
   try {
@@ -165,18 +216,7 @@ export function extractMessageText(
   message: OneBotMessageEvent,
   opts: { stripMention: boolean; selfId?: number | null } = { stripMention: true }
 ): string {
-  if (Array.isArray(message.message)) {
-    return message.message
-      .map((segment) => textFromSegment(segment, opts))
-      .join("")
-      .replace(/[ \t]+\n/g, "\n")
-      .trim();
-  }
-
-  const raw = typeof message.message === "string" ? message.message : (message.raw_message ?? "");
-  if (!opts.stripMention || opts.selfId == null) return raw.trim();
-  const escaped = String(opts.selfId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return raw.replace(new RegExp(`\\[CQ:at,qq=${escaped}\\]\\s*`, "g"), "").trim();
+  return partsToText(extractInboundParts(message, opts), { includeMedia: false });
 }
 
 export function isMentioned(message: OneBotMessageEvent, selfId?: number | null): boolean {
@@ -192,18 +232,6 @@ export function isMentioned(message: OneBotMessageEvent, selfId?: number | null)
   return raw.includes(`[CQ:at,qq=${selfId}]`);
 }
 
-function textFromSegment(segment: OneBotMessageSegment, opts: { stripMention: boolean; selfId?: number | null }): string {
-  if (segment.type === "text") {
-    return typeof segment.data?.text === "string" ? segment.data.text : "";
-  }
-  if (segment.type === "at") {
-    const qq = segment.data?.qq;
-    if (opts.stripMention && opts.selfId != null && String(qq) === String(opts.selfId)) return "";
-    return `@${String(qq ?? "")}`;
-  }
-  return "";
-}
-
 function resolveAgentId(api: OpenClawPluginApi, config: OneBotHookConfig, target: CapturedReplyTarget): string {
   const runtime = api.runtime;
   const peer = target.kind === "group"
@@ -217,6 +245,27 @@ function resolveAgentId(api: OpenClawPluginApi, config: OneBotHookConfig, target
     peer,
   });
   return typeof route?.agentId === "string" && route.agentId.trim() ? route.agentId : "main";
+}
+
+function mergeInboundBody(formattedBody: unknown, content: Record<string, unknown>[]): Record<string, unknown> {
+  if (formattedBody && typeof formattedBody === "object" && !Array.isArray(formattedBody)) {
+    return { ...(formattedBody as Record<string, unknown>), content };
+  }
+  return { content };
+}
+
+function finalizeInboundContextIfAvailable(runtime: any, ctxPayload: Record<string, unknown>, logger: LoggerLike): Record<string, unknown> {
+  const finalize = runtime?.channel?.reply?.finalizeInboundContext ?? runtime?.channel?.inbound?.finalizeInboundContext;
+  if (typeof finalize !== "function") return ctxPayload;
+  try {
+    const finalized = finalize(ctxPayload);
+    if (finalized && typeof finalized === "object" && !Array.isArray(finalized)) {
+      return finalized as Record<string, unknown>;
+    }
+  } catch (error) {
+    logger.warn?.(`[onebot-hook] finalizeInboundContext failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return ctxPayload;
 }
 
 async function recordInboundSessionIfAvailable(
