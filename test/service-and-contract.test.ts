@@ -244,6 +244,56 @@ describe("processInboundMessage integration", () => {
     expect(sendGroupMsg).toHaveBeenCalledWith(90001, [{ type: "image", data: { file: "https://example.test/group.png" } }]);
   });
 
+  it("sends tool result images to the captured group target while preserving the final text reply", async () => {
+    const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 8 } });
+    const client = { sendGroupMsg } as unknown as OneBotClient;
+    const dispatcher = vi.fn(async ({ dispatcherOptions, replyOptions }) => {
+      expect(replyOptions.verboseLevel).toBe("on");
+      expect(replyOptions.shouldEmitToolResult()).toBe(true);
+      expect(replyOptions.shouldEmitToolOutput()).toBe(false);
+      await replyOptions.onToolResult({
+        contentItems: [{ type: "inputImage", imageUrl: "data:image/png;base64,iVBORw0KGgo=" }],
+      });
+      await dispatcherOptions.deliver("小家伙，查好了。", { kind: "final" });
+    });
+
+    await processInboundMessage(api(dispatcher), client, config(), {
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "at", data: { qq: 42 } },
+        { type: "text", data: { text: "查下我的天气" } },
+      ],
+    });
+
+    expect(dispatcher).toHaveBeenCalledTimes(1);
+    expect(sendGroupMsg).toHaveBeenNthCalledWith(1, 90001, [{ type: "image", data: { file: "base64://iVBORw0KGgo=" } }]);
+    expect(sendGroupMsg).toHaveBeenNthCalledWith(2, 90001, "小家伙，查好了。");
+  });
+
+  it("does not forward text-only tool results to a captured private target", async () => {
+    const sendPrivateMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 9 } });
+    const client = { sendPrivateMsg } as unknown as OneBotClient;
+    const dispatcher = vi.fn(async ({ replyOptions, dispatcherOptions }) => {
+      await replyOptions.onToolResult("destiny2_card_query completed");
+      await dispatcherOptions.deliver("final reply", { kind: "final" });
+    });
+
+    await processInboundMessage(api(dispatcher), client, config(), {
+      post_type: "message",
+      message_type: "private",
+      self_id: 42,
+      user_id: 10001,
+      raw_message: "查下我的天气",
+    });
+
+    expect(sendPrivateMsg).toHaveBeenCalledTimes(1);
+    expect(sendPrivateMsg).toHaveBeenCalledWith(10001, "final reply");
+  });
+
   it("does not dispatch untriggered group messages", async () => {
     const client = {} as OneBotClient;
     const dispatcher = vi.fn();

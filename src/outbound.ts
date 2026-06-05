@@ -8,8 +8,16 @@ type ReplyPayload = string | {
   text?: unknown;
   body?: unknown;
   content?: unknown;
+  contentItems?: unknown;
   mediaUrl?: unknown;
   mediaUrls?: unknown;
+  dataUri?: unknown;
+  imageUrl?: unknown;
+  image_url?: unknown;
+  url?: unknown;
+  file?: unknown;
+  path?: unknown;
+  source?: unknown;
 };
 
 type ReplyPart = { kind: "text"; text: string; rawText: string } | { kind: "image"; url: string; alt?: string };
@@ -74,6 +82,7 @@ export class ReplyChunkSender {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushChain: Promise<void> = Promise.resolve();
   private imageCount = 0;
+  private seenImageUrls = new Set<string>();
   private noReplySeen = false;
   readonly sent: SendAttempt[] = [];
 
@@ -86,7 +95,8 @@ export class ReplyChunkSender {
   ) {}
 
   async deliver(payload: unknown, info: { kind?: string } = {}): Promise<void> {
-    const parts = this.extractParts(payload as ReplyPayload);
+    const toolInfo = isToolInfo(info);
+    const parts = this.extractParts(payload as ReplyPayload, { mediaOnly: toolInfo });
     if (parts.length === 0) return;
     if (isNoReply(parts)) {
       this.noReplySeen = true;
@@ -101,6 +111,10 @@ export class ReplyChunkSender {
       }
 
       if (!this.config.media.enabled) continue;
+      if (this.seenImageUrls.has(part.url)) {
+        this.logger.debug?.("[onebot-hook] outbound image skipped: duplicate media source");
+        continue;
+      }
       if (this.imageCount >= this.config.media.maxImagesPerReply) {
         this.logger.warn?.("[onebot-hook] outbound image skipped: maxImagesPerReply reached");
         continue;
@@ -108,9 +122,10 @@ export class ReplyChunkSender {
       this.flushTextIntoParts();
       this.partsBuffer.push(part);
       this.imageCount += 1;
+      this.seenImageUrls.add(part.url);
     }
 
-    if (this.shouldFlushNow() || info.kind === "final") {
+    if (toolInfo || this.shouldFlushNow() || info.kind === "final") {
       await this.queueFlush();
     } else {
       this.scheduleFlush();
@@ -119,6 +134,10 @@ export class ReplyChunkSender {
     if (info.kind === "final") {
       await this.finish();
     }
+  }
+
+  async deliverToolResult(payload: unknown): Promise<void> {
+    await this.deliver(payload, { kind: "tool-result" });
   }
 
   async finish(): Promise<void> {
@@ -132,35 +151,44 @@ export class ReplyChunkSender {
     await this.flushChain;
   }
 
-  private extractParts(payload: ReplyPayload): ReplyPart[] {
-    if (typeof payload === "string") return this.extractTextAndMarkdownImages(payload);
+  private extractParts(payload: ReplyPayload, opts: { mediaOnly?: boolean } = {}): ReplyPart[] {
+    if (typeof payload === "string") return opts.mediaOnly ? [] : this.extractTextAndMarkdownImages(payload);
     if (!payload || typeof payload !== "object") return [];
 
-    const contentParts = Array.isArray(payload.content) ? this.extractContentParts(payload.content) : [];
-    const parts = contentParts.length > 0 ? contentParts : this.extractTextAndMarkdownImages(stringValue(payload.text) ?? stringValue(payload.body) ?? "");
+    const parts: ReplyPart[] = [];
+    const contentParts = Array.isArray(payload.content) ? this.extractContentParts(payload.content, opts) : [];
+    const contentItemParts = Array.isArray(payload.contentItems) ? this.extractContentParts(payload.contentItems, opts) : [];
+    parts.push(...contentParts, ...contentItemParts);
+    if (!opts.mediaOnly && parts.length === 0) {
+      parts.push(...this.extractTextAndMarkdownImages(stringValue(payload.text) ?? stringValue(payload.body) ?? ""));
+    }
     for (const url of normalizeUrlList(payload.mediaUrl)) parts.push({ kind: "image", url });
     for (const url of normalizeUrlList(payload.mediaUrls)) parts.push({ kind: "image", url });
+    const directImage = imageUrlFromContentItem(payload as Record<string, unknown>);
+    if (directImage) parts.push({ kind: "image", url: directImage });
     return parts;
   }
 
-  private extractContentParts(content: unknown[]): ReplyPart[] {
+  private extractContentParts(content: unknown[], opts: { mediaOnly?: boolean } = {}): ReplyPart[] {
     const parts: ReplyPart[] = [];
     for (const item of content) {
       if (typeof item === "string") {
-        parts.push(...this.extractTextAndMarkdownImages(item));
+        if (!opts.mediaOnly) parts.push(...this.extractTextAndMarkdownImages(item));
         continue;
       }
       if (!item || typeof item !== "object") continue;
       const value = item as Record<string, unknown>;
       const type = stringValue(value.type);
       if (type === "text") {
-        parts.push(...this.extractTextAndMarkdownImages(stringValue(value.text) ?? ""));
+        if (!opts.mediaOnly) parts.push(...this.extractTextAndMarkdownImages(stringValue(value.text) ?? ""));
         continue;
       }
       const imageUrl = imageUrlFromContentItem(value);
-      if (imageUrl && (type === "image" || type === "image_url" || type === "input_image" || !type)) {
+      if (imageUrl && isImageContentType(type)) {
         parts.push({ kind: "image", url: imageUrl, alt: stringValue(value.alt) });
       }
+      if (Array.isArray(value.content)) parts.push(...this.extractContentParts(value.content, opts));
+      if (Array.isArray(value.contentItems)) parts.push(...this.extractContentParts(value.contentItems, opts));
     }
     return parts;
   }
@@ -276,14 +304,26 @@ function isNoReply(parts: ReplyPart[]): boolean {
 }
 
 function normalizeUrlList(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map((item) => normalizeOutboundImageSource(stringValue(item))).filter((item): item is string => Boolean(item));
+  if (Array.isArray(value)) return value.map((item) => {
+    if (item && typeof item === "object") return imageUrlFromContentItem(item as Record<string, unknown>);
+    return normalizeOutboundImageSource(stringValue(item));
+  }).filter((item): item is string => Boolean(item));
   const single = normalizeOutboundImageSource(stringValue(value));
   return single ? [single] : [];
 }
 
 function imageUrlFromContentItem(value: Record<string, unknown>): string | undefined {
-  const direct = stringValue(value.url) ?? stringValue(value.imageUrl) ?? stringValue(value.file) ?? stringValue(value.source) ?? stringValue(value.mediaUrl);
+  const direct =
+    stringValue(value.url) ??
+    stringValue(value.imageUrl) ??
+    stringValue(value.file) ??
+    stringValue(value.path) ??
+    stringValue(value.source) ??
+    stringValue(value.mediaUrl) ??
+    stringValue(value.dataUri);
   if (direct) return normalizeOutboundImageSource(direct);
+  const camelImageUrl = value.imageUrl;
+  if (camelImageUrl && typeof camelImageUrl === "object") return normalizeOutboundImageSource(stringValue((camelImageUrl as Record<string, unknown>).url));
   const imageUrl = value.image_url;
   if (typeof imageUrl === "string") return normalizeOutboundImageSource(imageUrl);
   if (imageUrl && typeof imageUrl === "object") return normalizeOutboundImageSource(stringValue((imageUrl as Record<string, unknown>).url));
@@ -292,9 +332,19 @@ function imageUrlFromContentItem(value: Record<string, unknown>): string | undef
 
 export function normalizeOutboundImageSource(value: string | undefined): string | undefined {
   if (!value) return undefined;
+  const dataUri = /^data:image\/[a-z0-9.+-]+;base64,([\s\S]+)$/i.exec(value);
+  if (dataUri) return `base64://${dataUri[1].replace(/\s+/g, "")}`;
   if (/^(https?:\/\/|file:\/\/|base64:\/\/)/i.test(value)) return value;
   if (isAbsolute(value)) return pathToFileURL(value).href;
   return value;
+}
+
+function isImageContentType(type: string | undefined): boolean {
+  return !type || type === "image" || type === "image_url" || type === "input_image" || type === "inputImage" || type === "output_image";
+}
+
+function isToolInfo(info: { kind?: string }): boolean {
+  return (info.kind ?? "").toLowerCase().includes("tool");
 }
 
 function summarizeReplyParts(parts: ReplyPart[]): string {

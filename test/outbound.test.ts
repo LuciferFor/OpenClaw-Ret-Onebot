@@ -128,6 +128,76 @@ describe("ReplyChunkSender", () => {
     ]);
   });
 
+  it("sends tool result inputImage contentItems as OneBot image segments", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliverToolResult({
+      contentItems: [
+        { type: "inputImage", imageUrl: "data:image/png;base64,iVBORw0KGgo=" },
+      ],
+    });
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "base64://iVBORw0KGgo=" } }],
+    ]);
+  });
+
+  it("extracts nested tool result images and ignores text-only tool logs", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      }
+    );
+
+    await sender.deliver("destiny2_card_query completed", { kind: "tool-result" });
+    await sender.deliver(
+      {
+        type: "tool_result",
+        contentItems: [
+          { type: "text", text: "completed" },
+          { type: "output_image", image_url: { url: "https://example.test/card.png" } },
+        ],
+      },
+      { kind: "tool" }
+    );
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "https://example.test/card.png" } }],
+    ]);
+  });
+
+  it("deduplicates images across tool and final replies", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      }
+    );
+
+    await sender.deliverToolResult({ contentItems: [{ type: "inputImage", imageUrl: "https://example.test/card.png" }] });
+    await sender.deliver({ text: "查好了", mediaUrl: "https://example.test/card.png" }, { kind: "final" });
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "https://example.test/card.png" } }],
+      "查好了",
+    ]);
+  });
+
   it("can send a configured fallback when the model returns NO_REPLY", async () => {
     const sends: OneBotOutgoingMessage[] = [];
     const sender = new ReplyChunkSender(

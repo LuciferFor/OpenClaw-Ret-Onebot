@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { isAllowedByPeerLists } from "./config.js";
 import {
   buildAgentMediaPayloadFromParts,
@@ -21,6 +22,26 @@ import type {
 
 const MENTION_ONLY_PROMPT = "对方在群里直接 @ 了你，没有附加文字。请简短回应对方。";
 const MENTION_ONLY_FALLBACK_REPLY = "嗯？";
+
+const D2_DIRECT_BRIDGE_PATH = process.env.ONEBOT_D2_DIRECT_BRIDGE || "/home/node/.openclaw/workspace/tools/onebot/bridge-onebot-openclaw.js";
+const require = createRequire(import.meta.url);
+
+interface D2DirectBridge {
+  buildD2DirectInvocation?: (event: OneBotMessageEvent, text: string) => unknown;
+  executeD2DirectInvocation?: (event: OneBotMessageEvent, invocation: unknown, options?: Record<string, unknown>) => Promise<boolean>;
+  handleD2DirectRequest?: (event: OneBotMessageEvent, text: string) => Promise<boolean>;
+  isD2DirectReplayRequest?: (text: string) => boolean;
+}
+
+let d2DirectBridge: D2DirectBridge | null | undefined;
+const D2_DIRECT_HINT_WORDS = [
+  "命运2", "destiny", "d2", "bungie", "棒鸡", "战绩", "地牢", "突袭", "raid", "dungeon",
+  "宗师", "日落", "夜幕", "gm", "热力图", "活跃", "锻造", "图纸", "催化", "仓库", "库存", "背包",
+  "装备", "身上", "当前装备", "配装", "三百", "武器", "pvp", "熔炉", "试炼", "单局", "pgcr",
+  "冲锋枪", "微冲", "smg", "手炮", "喷子", "霰弹", "自动步枪", "脉冲", "斥候", "狙击",
+  "融合", "线融", "榴弹", "火箭", "筒子", "机枪", "剑", "弓", "手枪",
+  "发出来", "没发图", "没图", "图呢", "图片呢", "再发一次", "重发",
+];
 
 export interface InboundDecision {
   forward: boolean;
@@ -92,6 +113,10 @@ export async function processInboundMessage(
   if (!decision.forward || !decision.target) {
     logger.debug?.(`[onebot-hook] inbound ignored: ${decision.reason}`);
     return false;
+  }
+
+  if (await processD2DirectIfMatched(client, config, message, decision, logger)) {
+    return true;
   }
 
   const runtime = api.runtime;
@@ -199,6 +224,12 @@ export async function processInboundMessage(
       replyOptions: {
         disableBlockStreaming: false,
         sourceReplyDeliveryMode: "automatic",
+        verboseLevel: "on",
+        shouldEmitToolResult: () => true,
+        shouldEmitToolOutput: () => false,
+        onToolResult: async (payload: unknown) => {
+          await chunkSender.deliverToolResult(payload);
+        },
       },
     });
     return true;
@@ -217,6 +248,72 @@ export function extractMessageText(
   opts: { stripMention: boolean; selfId?: number | null } = { stripMention: true }
 ): string {
   return partsToText(extractInboundParts(message, opts), { includeMedia: false });
+}
+
+async function processD2DirectIfMatched(
+  client: OneBotClient,
+  config: OneBotHookConfig,
+  message: OneBotMessageEvent,
+  decision: InboundDecision,
+  logger: LoggerLike
+): Promise<boolean> {
+  const text = decision.text.trim();
+  if (!text || decision.hasMedia || !decision.target) return false;
+  if (!maybeD2DirectText(text)) return false;
+
+  const bridge = loadD2DirectBridge(logger);
+  if (!bridge) {
+    await sendOneBotMessageToCapturedTarget(client, config, decision.target, "命运2查询失败：D2 直通组件不可用，请检查 bridge 部署。", logger);
+    return true;
+  }
+
+  const event: OneBotMessageEvent = {
+    ...message,
+    raw_message: text,
+    message: text,
+  };
+
+  const invocation = bridge.buildD2DirectInvocation?.(event, text);
+  const replay = invocation ? false : Boolean(bridge.isD2DirectReplayRequest?.(text));
+  if (!invocation && !replay) {
+    await sendOneBotMessageToCapturedTarget(client, config, decision.target, "没有生成图片：这条命运2查询没有识别到可执行的卡片类型。", logger);
+    return true;
+  }
+
+  try {
+    logger.info?.(`[onebot-hook] d2-direct-start ${decision.target.kind}:${decision.target.id} user:${message.user_id ?? ""} ${invocation ? "fresh" : "replay"}`);
+    const handled = invocation && bridge.executeD2DirectInvocation
+      ? await bridge.executeD2DirectInvocation(event, invocation, { replay: false })
+      : await bridge.handleD2DirectRequest?.(event, text);
+    if (!handled) {
+      await sendOneBotMessageToCapturedTarget(client, config, decision.target, "没有生成图片：命运2直通查询没有返回可发送内容。", logger);
+    }
+    return true;
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    logger.error?.(`[onebot-hook] d2-direct failed: ${messageText}`);
+    await sendOneBotMessageToCapturedTarget(client, config, decision.target, `命运2查询失败：${messageText}`, logger).catch((sendError) => {
+      logger.error?.(`[onebot-hook] d2-direct error reply failed: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+    });
+    return true;
+  }
+}
+
+function maybeD2DirectText(text: string): boolean {
+  const value = text.toLowerCase();
+  return D2_DIRECT_HINT_WORDS.some((word) => value.includes(word.toLowerCase()));
+}
+
+function loadD2DirectBridge(logger: LoggerLike): D2DirectBridge | null {
+  if (d2DirectBridge !== undefined) return d2DirectBridge;
+  try {
+    const loaded = require(D2_DIRECT_BRIDGE_PATH) as D2DirectBridge;
+    d2DirectBridge = loaded && typeof loaded === "object" ? loaded : null;
+  } catch (error) {
+    d2DirectBridge = null;
+    logger.warn?.(`[onebot-hook] d2-direct bridge unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return d2DirectBridge;
 }
 
 export function isMentioned(message: OneBotMessageEvent, selfId?: number | null): boolean {
