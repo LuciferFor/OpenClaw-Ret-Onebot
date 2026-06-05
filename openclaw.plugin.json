@@ -1,0 +1,135 @@
+{
+  "id": "openclaw-onebot-hook",
+  "name": "OneBot Reliable Hook",
+  "version": "0.1.0",
+  "description": "OneBot v11 channel plugin that forwards inbound messages and delivers OpenClaw replies in the service layer, without agent tools or skills.",
+  "author": "OpenClaw Ret Onebot",
+  "channels": ["onebot"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "onebot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the OneBot hook channel."
+        },
+        "ws": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["forward", "reverse"],
+              "default": "forward",
+              "description": "forward connects to OneBot WebSocket; reverse listens for OneBot reverse WebSocket."
+            },
+            "url": {
+              "type": "string",
+              "description": "Forward WebSocket URL, for example ws://127.0.0.1:3001/onebot/v11/ws."
+            },
+            "listenHost": {
+              "type": "string",
+              "default": "127.0.0.1",
+              "description": "Reverse WebSocket listen host."
+            },
+            "listenPort": {
+              "type": "number",
+              "default": 3002,
+              "description": "Reverse WebSocket listen port."
+            },
+            "path": {
+              "type": "string",
+              "default": "/onebot/v11/ws",
+              "description": "Reverse WebSocket path."
+            }
+          }
+        },
+        "httpUrl": {
+          "type": "string",
+          "description": "OneBot HTTP API root, for example http://127.0.0.1:3001. Recommended for reliable sends."
+        },
+        "accessToken": {
+          "type": "string",
+          "description": "OneBot access token."
+        },
+        "trigger": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "private": {
+              "type": "string",
+              "enum": ["all"],
+              "default": "all"
+            },
+            "group": {
+              "type": "string",
+              "enum": ["mention_or_keyword"],
+              "default": "mention_or_keyword"
+            },
+            "keywords": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "stripMention": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "allowFrom": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Allowed senders or groups, for example user:123 or group:456. Empty means allow all."
+        },
+        "denyFrom": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Denied senders or groups, for example user:123 or group:456."
+        },
+        "reply": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["chunked"],
+              "default": "chunked"
+            },
+            "flushIntervalMs": {
+              "type": "number",
+              "default": 1200
+            },
+            "flushChars": {
+              "type": "number",
+              "default": 160
+            },
+            "markdownToPlain": {
+              "type": "boolean",
+              "default": true
+            },
+            "maxRetries": {
+              "type": "number",
+              "default": 3
+            }
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "accessToken": { "label": "Access Token", "sensitive": true },
+    "httpUrl": { "label": "HTTP API URL", "placeholder": "http://127.0.0.1:3001" },
+    "ws.url": { "label": "WebSocket URL", "placeholder": "ws://127.0.0.1:3001/onebot/v11/ws" }
+  }
+}
