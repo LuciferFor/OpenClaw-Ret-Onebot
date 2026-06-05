@@ -147,6 +147,7 @@ export async function processInboundMessage(
       },
       replyOptions: {
         disableBlockStreaming: false,
+        sourceReplyDeliveryMode: "automatic",
       },
     });
     return true;
@@ -252,4 +253,3 @@ function numberValue(value: unknown): number | undefined {
   if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
   return undefined;
 }
-
