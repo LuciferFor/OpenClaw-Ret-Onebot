@@ -160,6 +160,54 @@ describe("processInboundMessage integration", () => {
     expect(sendGroupMsg).toHaveBeenCalledWith(90001, "嗯？");
   });
 
+  it("sends a fallback reply when any triggered group message gets NO_REPLY", async () => {
+    const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 10 } });
+    const client = { sendGroupMsg } as unknown as OneBotClient;
+    const dispatcher = vi.fn(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver("NO_REPLY", { kind: "final" });
+    });
+
+    await processInboundMessage(api(dispatcher), client, config(), {
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "at", data: { qq: 42 } },
+        { type: "text", data: { text: "在么" } },
+      ],
+      raw_message: "[CQ:at,qq=42] 在么",
+    });
+
+    expect(dispatcher).toHaveBeenCalledTimes(1);
+    expect(sendGroupMsg).toHaveBeenCalledWith(90001, "在。");
+  });
+
+  it("sends a fallback reply when a triggered group message produces no deliverable output", async () => {
+    const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 11 } });
+    const client = { sendGroupMsg } as unknown as OneBotClient;
+    const dispatcher = vi.fn(async () => {
+      // Simulates OpenClaw recording NO_REPLY internally without handing it to channel delivery.
+    });
+
+    await processInboundMessage(api(dispatcher), client, config(), {
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "at", data: { qq: 42 } },
+        { type: "text", data: { text: "说话" } },
+      ],
+      raw_message: "[CQ:at,qq=42] 说话",
+    });
+
+    expect(dispatcher).toHaveBeenCalledTimes(1);
+    expect(sendGroupMsg).toHaveBeenCalledWith(90001, "在。");
+  });
+
   it("passes inbound image blocks to OpenClaw and sends mixed private replies as OneBot segments", async () => {
     const sendPrivateMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 3 } });
     const client = { sendPrivateMsg } as unknown as OneBotClient;

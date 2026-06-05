@@ -198,6 +198,87 @@ describe("ReplyChunkSender", () => {
     ]);
   });
 
+  it("suppresses final chatter after strict tool image output", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      { suppressFinalTextAfterToolResult: true }
+    );
+
+    await sender.deliverToolResult({ contentItems: [{ type: "inputImage", imageUrl: "https://example.test/d2.png" }] });
+    await sender.deliver("查好了，主人。", { kind: "final" });
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "https://example.test/d2.png" } }],
+    ]);
+  });
+
+  it("forwards strict tool result links and suppresses final chatter", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      { suppressFinalTextAfterToolResult: true, forwardToolResultLinks: true }
+    );
+
+    await sender.deliverToolResult({
+      contentItems: [{ type: "text", text: "请打开 https://www.luciferfore.com/d2/share/abc 查看结果" }],
+    });
+    await sender.deliver("我已经给你整理好了。", { kind: "final" });
+
+    expect(sends).toEqual(["请打开 https://www.luciferfore.com/d2/share/abc 查看结果"]);
+  });
+
+  it("suppresses final chatter when strict tool results contain no sendable output", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      { suppressFinalTextAfterToolResult: true, forwardToolResultLinks: true }
+    );
+
+    await sender.deliverToolResult("destiny2_card_query completed");
+    await sender.deliver("查好了，主人。", { kind: "final" });
+    await sender.finish();
+
+    expect(sends).toEqual([]);
+  });
+
+  it("only forwards final links after empty strict tool results", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      { suppressFinalTextAfterToolResult: true, forwardToolResultLinks: true }
+    );
+
+    await sender.deliverToolResult("destiny2_card_query completed");
+    await sender.deliver("查好了，网页在 https://www.luciferfore.com/d2/share/def", { kind: "final" });
+
+    expect(sends).toEqual(["https://www.luciferfore.com/d2/share/def"]);
+  });
+
   it("can send a configured fallback when the model returns NO_REPLY", async () => {
     const sends: OneBotOutgoingMessage[] = [];
     const sender = new ReplyChunkSender(

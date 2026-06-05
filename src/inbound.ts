@@ -10,7 +10,7 @@ import {
   summarizeMediaParts,
 } from "./media.js";
 import { isOkResponse, OneBotClient } from "./onebot-client.js";
-import { ReplyChunkSender, sendOneBotMessageToCapturedTarget } from "./outbound.js";
+import { ReplyChunkSender, sendOneBotMessageToCapturedTarget, type ReplyChunkSenderOptions } from "./outbound.js";
 import type {
   CapturedReplyTarget,
   InboundMessagePart,
@@ -22,6 +22,7 @@ import type {
 
 const MENTION_ONLY_PROMPT = "对方在群里直接 @ 了你，没有附加文字。请简短回应对方。";
 const MENTION_ONLY_FALLBACK_REPLY = "嗯？";
+const GROUP_TRIGGERED_FALLBACK_REPLY = "在。";
 
 const D2_DIRECT_BRIDGE_PATH = process.env.ONEBOT_D2_DIRECT_BRIDGE || "/home/node/.openclaw/workspace/tools/onebot/bridge-onebot-openclaw.js";
 const require = createRequire(import.meta.url);
@@ -37,7 +38,7 @@ let d2DirectBridge: D2DirectBridge | null | undefined;
 const D2_DIRECT_HINT_WORDS = [
   "命运2", "destiny", "d2", "bungie", "棒鸡", "战绩", "地牢", "突袭", "raid", "dungeon",
   "宗师", "日落", "夜幕", "gm", "热力图", "活跃", "锻造", "图纸", "催化", "仓库", "库存", "背包",
-  "装备", "身上", "当前装备", "配装", "三百", "武器", "pvp", "熔炉", "试炼", "单局", "pgcr",
+  "装备", "身上", "当前装备", "配装", "套装", "三百", "凑", "纪律", "韧性", "恢复", "智慧", "机动", "力量", "武器", "pvp", "熔炉", "试炼", "单局", "pgcr",
   "冲锋枪", "微冲", "smg", "手炮", "喷子", "霰弹", "自动步枪", "脉冲", "斥候", "狙击",
   "融合", "线融", "榴弹", "火箭", "筒子", "机枪", "剑", "弓", "手枪",
   "发出来", "没发图", "没图", "图呢", "图片呢", "再发一次", "重发",
@@ -199,14 +200,18 @@ export async function processInboundMessage(
 
   await recordInboundSessionIfAvailable(api, sessionKey, ctxPayload, config, target, logger);
 
+  const replyOptions = noReplyFallbackOptions(decision, target);
+  if (maybeD2DirectText(decision.text)) {
+    replyOptions.suppressFinalTextAfterToolResult = true;
+    replyOptions.forwardToolResultLinks = true;
+  }
+
   const chunkSender = new ReplyChunkSender(
     config,
     target,
     (captured, message) => sendOneBotMessageToCapturedTarget(client, config, captured, message, logger),
     logger,
-    decision.reason === "group-mentioned" && decision.text === MENTION_ONLY_PROMPT
-      ? { noReplyFallback: MENTION_ONLY_FALLBACK_REPLY }
-      : {}
+    replyOptions
   );
 
   try {
@@ -342,6 +347,17 @@ function resolveAgentId(api: OpenClawPluginApi, config: OneBotHookConfig, target
     peer,
   });
   return typeof route?.agentId === "string" && route.agentId.trim() ? route.agentId : "main";
+}
+
+function noReplyFallbackOptions(decision: InboundDecision, target: CapturedReplyTarget): ReplyChunkSenderOptions {
+  if (target.kind !== "group") return {};
+  if (decision.reason === "group-mentioned" && decision.text === MENTION_ONLY_PROMPT) {
+    return { noReplyFallback: MENTION_ONLY_FALLBACK_REPLY, alwaysFallbackOnEmpty: true };
+  }
+  if (decision.reason === "group-mentioned" || decision.reason === "group-keyword") {
+    return { noReplyFallback: GROUP_TRIGGERED_FALLBACK_REPLY, alwaysFallbackOnEmpty: true };
+  }
+  return {};
 }
 
 function mergeInboundBody(formattedBody: unknown, content: Record<string, unknown>[]): Record<string, unknown> {

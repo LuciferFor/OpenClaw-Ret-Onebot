@@ -34,6 +34,9 @@ export type SendTextFn = (target: CapturedReplyTarget, text: string) => Promise<
 
 export interface ReplyChunkSenderOptions {
   noReplyFallback?: string;
+  alwaysFallbackOnEmpty?: boolean;
+  suppressFinalTextAfterToolResult?: boolean;
+  forwardToolResultLinks?: boolean;
 }
 
 export async function sendTextToCapturedTarget(
@@ -84,6 +87,8 @@ export class ReplyChunkSender {
   private imageCount = 0;
   private seenImageUrls = new Set<string>();
   private noReplySeen = false;
+  private toolResultSeen = false;
+  private toolResultOutputSeen = false;
   readonly sent: SendAttempt[] = [];
 
   constructor(
@@ -96,12 +101,28 @@ export class ReplyChunkSender {
 
   async deliver(payload: unknown, info: { kind?: string } = {}): Promise<void> {
     const toolInfo = isToolInfo(info);
-    const parts = this.extractParts(payload as ReplyPayload, { mediaOnly: toolInfo });
+    let parts = this.extractParts(payload as ReplyPayload, {
+      mediaOnly: toolInfo,
+      textLinksOnly: toolInfo && this.options.forwardToolResultLinks === true,
+    });
+    if (info.kind === "final" && this.shouldFilterFinalAfterToolResult()) {
+      if (this.toolResultOutputSeen) {
+        this.logger.debug?.("[onebot-hook] final reply suppressed after tool result output");
+        return;
+      }
+      parts = finalImageOrLinkParts(parts);
+      if (parts.length === 0) {
+        this.logger.debug?.("[onebot-hook] final reply suppressed after empty tool result");
+        return;
+      }
+    }
+    if (toolInfo) this.toolResultSeen = true;
     if (parts.length === 0) return;
     if (isNoReply(parts)) {
       this.noReplySeen = true;
       return;
     }
+    if (toolInfo) this.toolResultOutputSeen = true;
 
     for (const part of parts) {
       if (part.kind === "text") {
@@ -151,8 +172,11 @@ export class ReplyChunkSender {
     await this.flushChain;
   }
 
-  private extractParts(payload: ReplyPayload, opts: { mediaOnly?: boolean } = {}): ReplyPart[] {
-    if (typeof payload === "string") return opts.mediaOnly ? [] : this.extractTextAndMarkdownImages(payload);
+  private extractParts(payload: ReplyPayload, opts: { mediaOnly?: boolean; textLinksOnly?: boolean } = {}): ReplyPart[] {
+    if (typeof payload === "string") {
+      if (opts.mediaOnly) return opts.textLinksOnly ? this.extractToolResultLinkText(payload) : [];
+      return this.extractTextAndMarkdownImages(payload);
+    }
     if (!payload || typeof payload !== "object") return [];
 
     const parts: ReplyPart[] = [];
@@ -169,7 +193,7 @@ export class ReplyChunkSender {
     return parts;
   }
 
-  private extractContentParts(content: unknown[], opts: { mediaOnly?: boolean } = {}): ReplyPart[] {
+  private extractContentParts(content: unknown[], opts: { mediaOnly?: boolean; textLinksOnly?: boolean } = {}): ReplyPart[] {
     const parts: ReplyPart[] = [];
     for (const item of content) {
       if (typeof item === "string") {
@@ -180,7 +204,12 @@ export class ReplyChunkSender {
       const value = item as Record<string, unknown>;
       const type = stringValue(value.type);
       if (type === "text") {
-        if (!opts.mediaOnly) parts.push(...this.extractTextAndMarkdownImages(stringValue(value.text) ?? ""));
+        const text = stringValue(value.text) ?? "";
+        if (opts.mediaOnly) {
+          if (opts.textLinksOnly) parts.push(...this.extractToolResultLinkText(text));
+        } else {
+          parts.push(...this.extractTextAndMarkdownImages(text));
+        }
         continue;
       }
       const imageUrl = imageUrlFromContentItem(value);
@@ -191,6 +220,12 @@ export class ReplyChunkSender {
       if (Array.isArray(value.contentItems)) parts.push(...this.extractContentParts(value.contentItems, opts));
     }
     return parts;
+  }
+
+  private extractToolResultLinkText(input: string): ReplyPart[] {
+    const text = this.prepareText(input);
+    if (!text || !hasUsefulLink(text)) return [];
+    return [{ kind: "text", text, rawText: input }];
   }
 
   private extractTextAndMarkdownImages(input: string): ReplyPart[] {
@@ -274,10 +309,15 @@ export class ReplyChunkSender {
   private shouldSendNoReplyFallback(): boolean {
     const fallback = this.options.noReplyFallback?.trim();
     if (!fallback) return false;
-    if (!this.noReplySeen) return false;
+    if (!this.noReplySeen && !this.options.alwaysFallbackOnEmpty) return false;
     if (this.sent.length > 0) return false;
     if (this.textBuffer.trim() || this.rawBuffer.trim() || this.partsBuffer.length > 0) return false;
     return true;
+  }
+
+  private shouldFilterFinalAfterToolResult(): boolean {
+    if (!this.options.suppressFinalTextAfterToolResult) return false;
+    return this.toolResultSeen;
   }
 }
 
@@ -345,6 +385,25 @@ function isImageContentType(type: string | undefined): boolean {
 
 function isToolInfo(info: { kind?: string }): boolean {
   return (info.kind ?? "").toLowerCase().includes("tool");
+}
+
+function hasUsefulLink(text: string): boolean {
+  return /https?:\/\/\S+/iu.test(text);
+}
+
+function finalImageOrLinkParts(parts: ReplyPart[]): ReplyPart[] {
+  const filtered: ReplyPart[] = [];
+  for (const part of parts) {
+    if (part.kind === "image") {
+      filtered.push(part);
+      continue;
+    }
+    const links = part.text.match(/https?:\/\/\S+/giu) ?? [];
+    if (links.length) {
+      filtered.push({ kind: "text", text: links.join("\n"), rawText: part.rawText });
+    }
+  }
+  return filtered;
 }
 
 function summarizeReplyParts(parts: ReplyPart[]): string {
