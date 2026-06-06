@@ -8,11 +8,17 @@
   "exports": "./dist/index.js",
   "files": [
     "dist",
+    "deploy",
+    "docs",
+    "scripts",
     "openclaw.plugin.json",
     "README.md"
   ],
   "openclaw": {
     "extensions": [
+      "./dist/index.js"
+    ],
+    "runtimeExtensions": [
       "./dist/index.js"
     ],
     "channel": {

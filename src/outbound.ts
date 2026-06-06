@@ -33,8 +33,6 @@ export type SendMessageFn = (target: CapturedReplyTarget, message: OneBotOutgoin
 export type SendTextFn = (target: CapturedReplyTarget, text: string) => Promise<string>;
 
 export interface ReplyChunkSenderOptions {
-  noReplyFallback?: string;
-  alwaysFallbackOnEmpty?: boolean;
   suppressFinalTextAfterToolResult?: boolean;
   forwardToolResultLinks?: boolean;
 }
@@ -86,7 +84,6 @@ export class ReplyChunkSender {
   private flushChain: Promise<void> = Promise.resolve();
   private imageCount = 0;
   private seenImageUrls = new Set<string>();
-  private noReplySeen = false;
   private toolResultSeen = false;
   private toolResultOutputSeen = false;
   readonly sent: SendAttempt[] = [];
@@ -119,7 +116,6 @@ export class ReplyChunkSender {
     if (toolInfo) this.toolResultSeen = true;
     if (parts.length === 0) return;
     if (isNoReply(parts)) {
-      this.noReplySeen = true;
       return;
     }
     if (toolInfo) this.toolResultOutputSeen = true;
@@ -163,11 +159,6 @@ export class ReplyChunkSender {
 
   async finish(): Promise<void> {
     this.clearTimer();
-    if (this.shouldSendNoReplyFallback()) {
-      this.textBuffer = this.options.noReplyFallback!.trim();
-      this.rawBuffer = this.options.noReplyFallback!.trim();
-      this.noReplySeen = false;
-    }
     await this.queueFlush();
     await this.flushChain;
   }
@@ -304,15 +295,6 @@ export class ReplyChunkSender {
     if (!this.flushTimer) return;
     clearTimeout(this.flushTimer);
     this.flushTimer = null;
-  }
-
-  private shouldSendNoReplyFallback(): boolean {
-    const fallback = this.options.noReplyFallback?.trim();
-    if (!fallback) return false;
-    if (!this.noReplySeen && !this.options.alwaysFallbackOnEmpty) return false;
-    if (this.sent.length > 0) return false;
-    if (this.textBuffer.trim() || this.rawBuffer.trim() || this.partsBuffer.length > 0) return false;
-    return true;
   }
 
   private shouldFilterFinalAfterToolResult(): boolean {

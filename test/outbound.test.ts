@@ -279,26 +279,7 @@ describe("ReplyChunkSender", () => {
     expect(sends).toEqual(["https://www.luciferfore.com/d2/share/def"]);
   });
 
-  it("can send a configured fallback when the model returns NO_REPLY", async () => {
-    const sends: OneBotOutgoingMessage[] = [];
-    const sender = new ReplyChunkSender(
-      config(),
-      { kind: "group", id: 90001 },
-      async (_target, message) => {
-        sends.push(message);
-        return "m1";
-      },
-      {},
-      { noReplyFallback: "嗯？" }
-    );
-
-    await sender.deliver("NO_REPLY", { kind: "final" });
-    await sender.finish();
-
-    expect(sends).toEqual(["嗯？"]);
-  });
-
-  it("does not send a fallback for NO_REPLY unless one is configured", async () => {
+  it("drops NO_REPLY without sending a fallback", async () => {
     const sends: OneBotOutgoingMessage[] = [];
     const sender = new ReplyChunkSender(
       config(),

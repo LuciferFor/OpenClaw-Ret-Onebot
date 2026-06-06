@@ -139,7 +139,7 @@ describe("processInboundMessage integration", () => {
     expect(sendGroupMsg).toHaveBeenCalledWith(90001, "mention reply");
   });
 
-  it("sends a fallback reply when a group mention-only ping gets NO_REPLY", async () => {
+  it("does not send a fallback reply when a group mention-only ping gets NO_REPLY", async () => {
     const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 7 } });
     const client = { sendGroupMsg } as unknown as OneBotClient;
     const dispatcher = vi.fn(async ({ dispatcherOptions }) => {
@@ -157,10 +157,10 @@ describe("processInboundMessage integration", () => {
     });
 
     expect(dispatcher).toHaveBeenCalledTimes(1);
-    expect(sendGroupMsg).toHaveBeenCalledWith(90001, "嗯？");
+    expect(sendGroupMsg).not.toHaveBeenCalled();
   });
 
-  it("sends a fallback reply when any triggered group message gets NO_REPLY", async () => {
+  it("does not send a fallback reply when any triggered group message gets NO_REPLY", async () => {
     const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 10 } });
     const client = { sendGroupMsg } as unknown as OneBotClient;
     const dispatcher = vi.fn(async ({ dispatcherOptions }) => {
@@ -181,10 +181,10 @@ describe("processInboundMessage integration", () => {
     });
 
     expect(dispatcher).toHaveBeenCalledTimes(1);
-    expect(sendGroupMsg).toHaveBeenCalledWith(90001, "在。");
+    expect(sendGroupMsg).not.toHaveBeenCalled();
   });
 
-  it("sends a fallback reply when a triggered group message produces no deliverable output", async () => {
+  it("does not send a fallback reply when a triggered group message produces no deliverable output", async () => {
     const sendGroupMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 11 } });
     const client = { sendGroupMsg } as unknown as OneBotClient;
     const dispatcher = vi.fn(async () => {
@@ -205,7 +205,7 @@ describe("processInboundMessage integration", () => {
     });
 
     expect(dispatcher).toHaveBeenCalledTimes(1);
-    expect(sendGroupMsg).toHaveBeenCalledWith(90001, "在。");
+    expect(sendGroupMsg).not.toHaveBeenCalled();
   });
 
   it("passes inbound image blocks to OpenClaw and sends mixed private replies as OneBot segments", async () => {

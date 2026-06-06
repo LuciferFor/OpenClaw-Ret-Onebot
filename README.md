@@ -74,3 +74,7 @@ Private messages are forwarded by default. Group messages are forwarded only whe
 npm run build
 npm test
 ```
+
+## Deployment Notes
+
+See [docs/deployment.md](docs/deployment.md) for the recorded `192.168.31.11` and `192.168.31.9` deployments, host profiles, service files, and troubleshooting commands.

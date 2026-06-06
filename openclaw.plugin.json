@@ -5,6 +5,11 @@
   "description": "OneBot v11 channel plugin that forwards inbound messages and delivers OpenClaw replies in the service layer, without agent tools or skills.",
   "author": "OpenClaw Ret Onebot",
   "channels": ["onebot"],
+  "activation": {
+    "onStartup": true,
+    "onChannels": ["onebot"],
+    "onCapabilities": ["channel"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

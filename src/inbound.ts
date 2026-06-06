@@ -21,8 +21,6 @@ import type {
 } from "./types.js";
 
 const MENTION_ONLY_PROMPT = "对方在群里直接 @ 了你，没有附加文字。请简短回应对方。";
-const MENTION_ONLY_FALLBACK_REPLY = "嗯？";
-const GROUP_TRIGGERED_FALLBACK_REPLY = "在。";
 
 const D2_DIRECT_BRIDGE_PATH = process.env.ONEBOT_D2_DIRECT_BRIDGE || "/home/node/.openclaw/workspace/tools/onebot/bridge-onebot-openclaw.js";
 const require = createRequire(import.meta.url);
@@ -200,7 +198,7 @@ export async function processInboundMessage(
 
   await recordInboundSessionIfAvailable(api, sessionKey, ctxPayload, config, target, logger);
 
-  const replyOptions = noReplyFallbackOptions(decision, target);
+  const replyOptions: ReplyChunkSenderOptions = {};
   if (maybeD2DirectText(decision.text)) {
     replyOptions.suppressFinalTextAfterToolResult = true;
     replyOptions.forwardToolResultLinks = true;
@@ -347,17 +345,6 @@ function resolveAgentId(api: OpenClawPluginApi, config: OneBotHookConfig, target
     peer,
   });
   return typeof route?.agentId === "string" && route.agentId.trim() ? route.agentId : "main";
-}
-
-function noReplyFallbackOptions(decision: InboundDecision, target: CapturedReplyTarget): ReplyChunkSenderOptions {
-  if (target.kind !== "group") return {};
-  if (decision.reason === "group-mentioned" && decision.text === MENTION_ONLY_PROMPT) {
-    return { noReplyFallback: MENTION_ONLY_FALLBACK_REPLY, alwaysFallbackOnEmpty: true };
-  }
-  if (decision.reason === "group-mentioned" || decision.reason === "group-keyword") {
-    return { noReplyFallback: GROUP_TRIGGERED_FALLBACK_REPLY, alwaysFallbackOnEmpty: true };
-  }
-  return {};
 }
 
 function mergeInboundBody(formattedBody: unknown, content: Record<string, unknown>[]): Record<string, unknown> {
