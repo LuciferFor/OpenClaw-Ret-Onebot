@@ -167,6 +167,7 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - 2026-06-07 14:15 的 zip 附件只在 OpenClaw 文本里显示路径，没有发到 QQ。当前 hook 已支持文件上传，文本中 allowlist 路径如 `/home/lucifer/.openclaw/workspace/out/*.zip` 会被识别并上传；上传失败会发文本兜底。
 - 2026-06-07 15:40 的 QQ zip 入站只变成 `[file: xxx.zip]` 占位，OpenClaw 拿不到内容。当前 hook 已支持入站文件下载落盘，成功后 OpenClaw 会看到 `/home/.../.openclaw/workspace/incoming/onebot-files/...zip`。
 - 2026-06-07 17:34 的 B 站视频下载请求仍在持续写 `*.trajectory.jsonl` 工具进度，但旧 sidecar 只盯 session JSONL，180 秒未见 assistant 后误判 idle 并 abort run，最终 QQ 没收到回复。当前 sidecar 同时监听 session trajectory 的 `tool.*` / `model.*` / `session.*` 事件，并会补发 `pendingFinalDeliveryText`。
+- 2026-06-07 21:49 的私聊先发图片、数秒后再发文字，旧 sidecar 把两条消息拆成两个并发 run，并且纯文本 `sessions.send` 里只带 `[image: xxx]` 占位，OpenClaw 看不到本地图片路径。当前 sidecar 会把媒体-only 入站短暂缓冲，默认等 `ONEBOT_INBOUND_MEDIA_GRACE_MS=8000`，并把下载后的图片 `[path: ...]` 写入模型可读文本。
 
 ## 新机器迁移清单
 
@@ -186,4 +187,5 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - OpenClaw 有 assistant 回复，QQ 没收到：查 OneBot HTTP、`send_private_msg` / `send_group_msg` 错误和 sidecar `sent private/group` 日志。
 - OpenClaw 回复里有本地文件路径但 QQ 没附件：查 `channels.onebot.files.allowedRoots`、`pathMappings`、文件是否真实存在，以及 sidecar journal 的 `uploaded ... file=` 或 `文件上传失败`。
 - QQ 发了文件但 OpenClaw 只看到文件名：查 sidecar journal 的 `inbound file download failed`，以及 `channels.onebot.files.downloadInboundFiles`、`incomingDir`、`maxFileBytes`、OneBot `get_file` / 文件 URL 是否可用。
+- QQ 发了图片但 OpenClaw 只看到 `[image: xxx]`：查 sidecar journal 是否有 `inbound image saved ... path=...`。若有日志但 prompt 没 path，确认远端 `dist/media.js` 是否包含图片 `[path: ...]` 占位逻辑；若图和文字分开发，确认 `ONEBOT_INBOUND_MEDIA_GRACE_MS` 未被设得过短。
 - 只有等很久才回复：查 OpenClaw `stalled session`，sidecar 应在 180 秒无进展后 abort。

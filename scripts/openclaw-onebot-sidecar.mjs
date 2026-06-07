@@ -21,6 +21,9 @@ const ASSISTANT_IDLE_TIMEOUT_MS = Number.parseInt(
 const ASSISTANT_MAX_WAIT_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_MAX_WAIT_MS || "600000", 10);
 const ASSISTANT_SETTLE_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_SETTLE_MS || "2000", 10);
 const ASSISTANT_CATCHUP_SCAN_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_CATCHUP_SCAN_MS || "3000", 10);
+const INBOUND_TEXT_DEBOUNCE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_TEXT_DEBOUNCE_MS || "400", 10);
+const INBOUND_MEDIA_GRACE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MEDIA_GRACE_MS || "8000", 10);
+const INBOUND_MAX_BATCH_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MAX_BATCH_MS || "12000", 10);
 
 const logger = {
   debug: (message) => console.log(`[onebot-sidecar] ${message}`),
@@ -41,6 +44,7 @@ let currentClient = null;
 let reconnectTimer = null;
 const deduper = new MessageDeduper();
 const sessionQueues = new Map();
+const inboundBuffers = new Map();
 const deliveredAssistantIdsBySession = new Map();
 
 function readJson(file, fallback) {
@@ -310,7 +314,7 @@ async function prepareInboundPromptText(config, decision, message, target) {
     },
     async (part) => resolveOneBotInboundFile(client, target, part),
   );
-  logPreparedInboundFiles(preparedParts, target);
+  logPreparedInboundMedia(preparedParts, target);
   return partsToText(preparedParts, { includeMedia: true }) || decision.promptText || decision.text;
 }
 
@@ -336,18 +340,76 @@ async function resolveOneBotInboundFile(client, target, part) {
   return response?.data ?? { file: part.file, file_id: part.fileId };
 }
 
-function logPreparedInboundFiles(parts, target) {
+function logPreparedInboundMedia(parts, target) {
   for (const part of parts) {
-    if (part?.kind !== "file") continue;
+    if (part?.kind !== "image" && part?.kind !== "file") continue;
     const name = part.filename || part.file || part.fileId || "file";
     if (part.downloadStatus === "saved") {
-      logger.info(`inbound file saved ${target.kind}:${target.id} file=${name} path=${part.localPath} size=${part.size ?? "unknown"}`);
+      logger.info(`inbound ${part.kind} saved ${target.kind}:${target.id} file=${name} path=${part.localPath} size=${part.size ?? "unknown"}`);
     } else if (part.downloadStatus === "failed") {
-      logger.warn(`inbound file failed ${target.kind}:${target.id} file=${name} reason=${part.downloadError || "unknown"}`);
+      logger.warn(`inbound ${part.kind} failed ${target.kind}:${target.id} file=${name} reason=${part.downloadError || "unknown"}`);
     } else {
-      logger.debug(`inbound file skipped ${target.kind}:${target.id} file=${name} reason=${part.downloadError || part.downloadStatus || "unknown"}`);
+      logger.debug(`inbound ${part.kind} skipped ${target.kind}:${target.id} file=${name} reason=${part.downloadError || part.downloadStatus || "unknown"}`);
     }
   }
+}
+
+function hasMediaWithoutText(item) {
+  return Boolean(item.decision?.hasMedia && !String(item.decision?.text || "").trim());
+}
+
+function hasVisibleText(item) {
+  return Boolean(String(item.decision?.text || "").trim());
+}
+
+function inboundBatchDelay(buffer) {
+  const age = Date.now() - buffer.firstAt;
+  if (age >= INBOUND_MAX_BATCH_MS) return 0;
+  const hasBareMedia = buffer.items.some(hasMediaWithoutText);
+  const hasText = buffer.items.some(hasVisibleText);
+  if (hasBareMedia && !hasText) return Math.max(0, Math.min(INBOUND_MEDIA_GRACE_MS, INBOUND_MAX_BATCH_MS - age));
+  return Math.max(0, Math.min(INBOUND_TEXT_DEBOUNCE_MS, INBOUND_MAX_BATCH_MS - age));
+}
+
+function queueInboundForDispatch(config, sessionKey, target, item) {
+  let buffer = inboundBuffers.get(sessionKey);
+  if (!buffer) {
+    buffer = { config, sessionKey, target, firstAt: Date.now(), items: [], timer: null };
+    inboundBuffers.set(sessionKey, buffer);
+  }
+  buffer.config = config;
+  buffer.target = target;
+  buffer.items.push(item);
+  if (buffer.timer) clearTimeout(buffer.timer);
+  const delay = inboundBatchDelay(buffer);
+  logger.debug(`queued inbound ${sessionKey} items=${buffer.items.length} delay_ms=${delay}`);
+  buffer.timer = setTimeout(() => {
+    void flushInboundBuffer(sessionKey).catch((error) => {
+      logger.error(`flush inbound failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+    });
+  }, delay);
+}
+
+async function flushInboundBuffer(sessionKey) {
+  const buffer = inboundBuffers.get(sessionKey);
+  if (!buffer) return;
+  inboundBuffers.delete(sessionKey);
+  if (buffer.timer) clearTimeout(buffer.timer);
+  const text = buffer.items
+    .map((item) => messageText(item.decision, item.message, item.preparedText))
+    .filter((item) => item && item.trim())
+    .join("\n")
+    .trim();
+  if (!text) return;
+  await enqueueSession(sessionKey, async () => {
+    const beforeFile = getSessionFile(sessionKey);
+    const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
+    const startedAt = Date.now();
+    logger.info(`dispatch ${sessionKey} target=${buffer.target.kind}:${buffer.target.id} messages=${buffer.items.length}`);
+    const result = await dispatchToOpenClaw(sessionKey, text);
+    logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
+    await waitAndForwardAssistant(buffer.config, buffer.target, sessionKey, beforeFile, beforeCursor, startedAt, result?.runId);
+  });
 }
 
 async function dispatchToOpenClaw(sessionKey, text) {
@@ -552,18 +614,7 @@ async function handleOneBotMessage(message) {
   const target = decision.target;
   const sessionKey = buildSessionKey(AGENT_ID, target);
   const preparedText = await prepareInboundPromptText(config, decision, message, target);
-  const dispatch = await enqueueSession(sessionKey, async () => {
-    const beforeFile = getSessionFile(sessionKey);
-    const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
-    const startedAt = Date.now();
-    logger.info(`dispatch ${sessionKey} target=${target.kind}:${target.id}`);
-    const result = await dispatchToOpenClaw(sessionKey, messageText(decision, message, preparedText));
-    logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
-    return { beforeFile, beforeCursor, startedAt, runId: result?.runId };
-  });
-  void waitAndForwardAssistant(config, target, sessionKey, dispatch.beforeFile, dispatch.beforeCursor, dispatch.startedAt, dispatch.runId).catch((error) => {
-    logger.error(`forward assistant failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
-  });
+  queueInboundForDispatch(config, sessionKey, target, { decision, message, preparedText });
 }
 
 async function connectOneBot() {
@@ -607,11 +658,19 @@ function sleep(ms) {
 process.on("SIGTERM", () => {
   stopping = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  for (const buffer of inboundBuffers.values()) {
+    if (buffer.timer) clearTimeout(buffer.timer);
+  }
+  inboundBuffers.clear();
   void currentClient?.stop?.().finally(() => process.exit(0));
 });
 process.on("SIGINT", () => {
   stopping = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  for (const buffer of inboundBuffers.values()) {
+    if (buffer.timer) clearTimeout(buffer.timer);
+  }
+  inboundBuffers.clear();
   void currentClient?.stop?.().finally(() => process.exit(0));
 });
 

@@ -230,6 +230,12 @@ export function summarizeMediaParts(parts: InboundMessagePart[]): Record<string,
 
 export function mediaPlaceholder(part: InboundMediaPart): string {
   const name = part.summary ?? part.filename ?? part.file ?? part.url ?? part.source ?? "media";
+  if (part.kind === "image" && part.localPath) {
+    return `\n[image: ${name}]\n[path: ${part.localPath}]\n`;
+  }
+  if (part.kind === "image" && part.downloadStatus === "failed" && part.downloadError) {
+    return `\n[image: ${name}]\n[download failed: ${part.downloadError}]\n`;
+  }
   if (part.kind === "file" && part.localPath) {
     return `\n[file: ${name}]\n[path: ${part.localPath}]\n`;
   }

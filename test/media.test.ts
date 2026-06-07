@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildAgentMediaPayloadFromParts, extractInboundParts, prepareInboundMediaParts } from "../src/media.js";
+import { buildAgentMediaPayloadFromParts, extractInboundParts, partsToText, prepareInboundMediaParts } from "../src/media.js";
 import type { InboundMediaPart, OneBotHookConfig } from "../src/types.js";
 
 const tempDirs: string[] = [];
@@ -71,6 +71,25 @@ describe("inbound media preparation", () => {
       MediaType: "image/png",
       MediaTypes: ["image/png"],
     });
+  });
+
+  it("includes cached image paths in model-readable placeholder text", () => {
+    const text = partsToText(
+      [
+        {
+          kind: "image",
+          segmentType: "image",
+          data: {},
+          file: "pic.png",
+          localPath: "/tmp/openclaw/pic.png",
+          mime: "image/png",
+        },
+      ],
+      { includeMedia: true },
+    );
+
+    expect(text).toContain("[image: pic.png]");
+    expect(text).toContain("[path: /tmp/openclaw/pic.png]");
   });
 
   it("does not expose bare OneBot file names as model-readable media paths", () => {
