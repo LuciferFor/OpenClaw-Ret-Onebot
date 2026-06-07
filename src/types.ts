@@ -35,6 +35,23 @@ export interface OneBotMediaConfig {
   maxImagesPerReply: number;
 }
 
+export interface OneBotFilePathMapping {
+  from: string;
+  to: string;
+}
+
+export interface OneBotFileConfig {
+  enabled: boolean;
+  maxFileBytes: number;
+  detectTextPaths: boolean;
+  downloadInboundFiles: boolean;
+  incomingDir: string;
+  downloadTimeoutMs: number;
+  allowedRoots: string[];
+  pathMappings: OneBotFilePathMapping[];
+  fallbackOnFailure: "text";
+}
+
 export interface OneBotHookConfig {
   enabled: boolean;
   accountId: string;
@@ -46,6 +63,7 @@ export interface OneBotHookConfig {
   denyFrom: string[];
   reply: OneBotReplyConfig;
   media: OneBotMediaConfig;
+  files: OneBotFileConfig;
 }
 
 export interface OneBotSenderInfo {
@@ -80,6 +98,7 @@ export interface InboundMediaPart {
   segmentType: string;
   data: Record<string, unknown>;
   file?: string;
+  fileId?: string;
   url?: string;
   source?: string;
   summary?: string;
@@ -134,11 +153,32 @@ export interface OneBotSendData {
   message_id?: number | string;
 }
 
+export interface OneBotFileUploadData {
+  message_id?: number | string;
+  file_id?: number | string;
+  file?: string;
+}
+
 export interface OneBotImageData {
   file?: string;
   url?: string;
   path?: string;
   filename?: string;
+  [key: string]: unknown;
+}
+
+export interface OneBotFileData {
+  file?: string;
+  file_id?: string;
+  url?: string;
+  path?: string;
+  name?: string;
+  filename?: string;
+  file_name?: string;
+  size?: number | string;
+  file_size?: number | string;
+  mime?: string;
+  mime_type?: string;
   [key: string]: unknown;
 }
 

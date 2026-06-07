@@ -60,13 +60,34 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
         "outboundMode": "segments",
         "markdownImages": true,
         "maxImagesPerReply": 6
+      },
+      "files": {
+        "enabled": true,
+        "maxFileBytes": 4294967296,
+        "detectTextPaths": true,
+        "downloadInboundFiles": true,
+        "incomingDir": "~/.openclaw/workspace/incoming/onebot-files",
+        "downloadTimeoutMs": 30000,
+        "allowedRoots": [
+          "~/.openclaw/workspace",
+          "/home/lucifer/.openclaw/workspace",
+          "/home/node/.openclaw/workspace"
+        ],
+        "pathMappings": [
+          {
+            "from": "/home/lucifer/.openclaw/workspace",
+            "to": "/home/node/.openclaw/workspace"
+          }
+        ],
+        "fallbackOnFailure": "text"
       }
     }
   }
 }
 ```
 
-Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present. Image + text messages preserve their OneBot segment order; inbound images are cached locally when possible and outbound images are sent as OneBot `image` segments.
+Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present. Image + text messages preserve their OneBot segment order; inbound images are cached locally when possible and outbound images are sent as OneBot `image` segments. File attachments are uploaded with OneBot/NapCat `upload_private_file` or `upload_group_file`; assistant text paths are only auto-uploaded when they point at a real file under `channels.onebot.files.allowedRoots`.
+Inbound OneBot `file` segments are downloaded into `channels.onebot.files.incomingDir` when OneBot exposes a URL, local path, base64 source, or a resolvable `get_file` result. The saved path is added to OpenClaw as `FilePath` / `FilePaths` and as a readable `[path: ...]` line in the prompt.
 
 ## Verify
 

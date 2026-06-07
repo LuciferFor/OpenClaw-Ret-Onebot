@@ -14,8 +14,13 @@ const SESSIONS_PATH = process.env.OPENCLAW_MAIN_SESSIONS_PATH || "/home/node/.op
 const GATEWAY_WS = process.env.OPENCLAW_GATEWAY_WS || "ws://127.0.0.1:18789/";
 const TRUSTED_USER = process.env.OPENCLAW_TRUSTED_USER || "lan@openclaw.local";
 const AGENT_ID = process.env.ONEBOT_AGENT_ID || "main";
-const ASSISTANT_TIMEOUT_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_TIMEOUT_MS || "60000", 10);
+const ASSISTANT_IDLE_TIMEOUT_MS = Number.parseInt(
+  process.env.ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS || process.env.ONEBOT_ASSISTANT_TIMEOUT_MS || "180000",
+  10,
+);
+const ASSISTANT_MAX_WAIT_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_MAX_WAIT_MS || "600000", 10);
 const ASSISTANT_SETTLE_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_SETTLE_MS || "2000", 10);
+const ASSISTANT_CATCHUP_SCAN_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_CATCHUP_SCAN_MS || "3000", 10);
 
 const logger = {
   debug: (message) => console.log(`[onebot-sidecar] ${message}`),
@@ -28,13 +33,14 @@ const importFromPlugin = async (relativePath) => import(pathToFileURL(path.join(
 const { getOneBotHookConfig } = await importFromPlugin("dist/config.js");
 const { MessageDeduper, OneBotClient } = await importFromPlugin("dist/onebot-client.js");
 const { decideInbound, buildSessionKey } = await importFromPlugin("dist/inbound.js");
-const { ReplyChunkSender, sendOneBotMessageToCapturedTarget } = await importFromPlugin("dist/outbound.js");
+const { ReplyChunkSender, sendOneBotFileToCapturedTarget, sendOneBotMessageToCapturedTarget } = await importFromPlugin("dist/outbound.js");
 
 let stopping = false;
 let currentClient = null;
 let reconnectTimer = null;
 const deduper = new MessageDeduper();
 const sessionQueues = new Map();
+const deliveredAssistantIdsBySession = new Map();
 
 function readJson(file, fallback) {
   try {
@@ -229,6 +235,16 @@ function readNewEntries(file, cursor) {
   }
 }
 
+function readAllEntries(file) {
+  if (!file || !fs.existsSync(file)) return [];
+  try {
+    return parseJsonLines(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    logger.warn(`failed to catch up session file ${file}: ${error.message || String(error)}`);
+    return [];
+  }
+}
+
 function enqueueSession(sessionKey, task) {
   const previous = sessionQueues.get(sessionKey) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(task).finally(() => {
@@ -236,6 +252,16 @@ function enqueueSession(sessionKey, task) {
   });
   sessionQueues.set(sessionKey, next);
   return next;
+}
+
+function deliveredAssistantIds(sessionKey) {
+  let ids = deliveredAssistantIdsBySession.get(sessionKey);
+  if (!ids) {
+    ids = new Set();
+    deliveredAssistantIdsBySession.set(sessionKey, ids);
+  }
+  if (ids.size > 1000) ids.clear();
+  return ids;
 }
 
 function messageText(decision, message) {
@@ -269,39 +295,105 @@ async function sendAssistantEntry(config, target, entry) {
     target,
     (captured, outgoing) => sendOneBotMessageToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, outgoing, logger),
     logger,
+    {
+      sendFile: (captured, file) => sendOneBotFileToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, file, logger),
+    },
   );
   await sender.deliver(entry.message, { kind: "final" });
   await sender.finish();
 }
 
+function hasVisibleAssistantPayload(message) {
+  if (!message || typeof message !== "object") return false;
+  if (typeof message.text === "string" && message.text.trim()) return true;
+  if (typeof message.content === "string" && message.content.trim()) return true;
+  if (message.mediaUrl || message.mediaUrls || message.imageUrl || message.image_url || message.file || message.path || message.filePath || message.fileUrl || message.url) return true;
+  if (!Array.isArray(message.content)) return false;
+  return message.content.some((item) => {
+    if (typeof item === "string") return item.trim().length > 0;
+    if (!item || typeof item !== "object") return false;
+    if (item.type === "text") return typeof item.text === "string" && item.text.trim().length > 0;
+    return ["image", "image_url", "inputImage", "input_image", "output_image", "file", "attachment", "output_file"].includes(item.type);
+  });
+}
+
+function entryShowsRunProgress(entry, startedAt) {
+  if (!entry || typeof entry !== "object") return false;
+  const ts = Date.parse(entry.timestamp || "");
+  if (Number.isFinite(ts) && ts + 1000 < startedAt) return false;
+  if (entry.type !== "message") return false;
+  const role = entry.message?.role;
+  return role === "assistant" || role === "toolResult" || role === "toolresult" || role === "tool";
+}
+
+function entryStableId(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  if (typeof entry.id === "string" && entry.id) return entry.id;
+  const role = entry.message?.role || "";
+  const content = typeof entry.message?.content === "string" ? entry.message.content : JSON.stringify(entry.message?.content ?? "");
+  return `${entry.timestamp || ""}:${role}:${content.slice(0, 160)}`;
+}
+
 async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, initialCursor, startedAt, runId) {
   let cursor = initialCursor;
   let file = sessionFile;
-  const sentIds = new Set();
+  const deliveredIds = deliveredAssistantIds(sessionKey);
+  const progressIds = new Set();
   let sentAny = false;
   let lastSentAt = 0;
-  const deadline = Date.now() + ASSISTANT_TIMEOUT_MS;
+  let lastProgressAt = startedAt;
+  let lastCatchupScanAt = 0;
+  const maxDeadline = startedAt + ASSISTANT_MAX_WAIT_MS;
 
-  while (Date.now() < deadline) {
-    if (!file) file = getSessionFile(sessionKey);
-    const result = readNewEntries(file, cursor);
-    cursor = result.cursor;
-    for (const entry of result.entries) {
+  const processEntries = async (entries, source) => {
+    for (const entry of entries) {
+      const stableId = entryStableId(entry);
+      if (entryShowsRunProgress(entry, startedAt) && !progressIds.has(stableId)) {
+        progressIds.add(stableId);
+        lastProgressAt = Date.now();
+      }
       if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
-      if (sentIds.has(entry.id)) continue;
+      if (deliveredIds.has(stableId)) continue;
       const ts = Date.parse(entry.timestamp || "");
       if (Number.isFinite(ts) && ts + 1000 < startedAt) continue;
-      sentIds.add(entry.id);
-      await sendAssistantEntry(config, target, entry);
+      if (!hasVisibleAssistantPayload(entry.message)) continue;
+      deliveredIds.add(stableId);
+      try {
+        await sendAssistantEntry(config, target, entry);
+      } catch (error) {
+        deliveredIds.delete(stableId);
+        throw error;
+      }
       sentAny = true;
       lastSentAt = Date.now();
-      logger.info(`forwarded assistant message ${entry.id} to ${target.kind}:${target.id}`);
+      logger.info(`forwarded assistant message ${entry.id ?? stableId} to ${target.kind}:${target.id}${source ? ` via ${source}` : ""}`);
     }
+  };
+
+  while (Date.now() < maxDeadline) {
+    const mappedFile = getSessionFile(sessionKey);
+    if (mappedFile && mappedFile !== file) {
+      logger.info(`session file switched for ${sessionKey}: ${file || "none"} -> ${mappedFile}`);
+      file = mappedFile;
+      cursor = 0;
+    }
+    const result = readNewEntries(file, cursor);
+    cursor = result.cursor;
+    await processEntries(result.entries, "incremental");
+
+    if (!sentAny && file && Date.now() - lastCatchupScanAt >= ASSISTANT_CATCHUP_SCAN_MS) {
+      lastCatchupScanAt = Date.now();
+      await processEntries(readAllEntries(file), "catchup");
+    }
+
     if (sentAny && Date.now() - lastSentAt >= ASSISTANT_SETTLE_MS) return true;
+    if (Date.now() - lastProgressAt >= ASSISTANT_IDLE_TIMEOUT_MS) break;
     await sleep(750);
   }
   if (!sentAny && runId) {
-    logger.warn(`assistant timeout for ${sessionKey}; aborting run=${runId}`);
+    const waitedMs = Date.now() - startedAt;
+    const idleMs = Date.now() - lastProgressAt;
+    logger.warn(`assistant timeout for ${sessionKey}; aborting run=${runId} waited_ms=${waitedMs} idle_ms=${idleMs}`);
     try {
       await abortOpenClawRun(sessionKey, runId);
       logger.warn(`aborted timed out run=${runId} for ${sessionKey}`);
@@ -325,14 +417,17 @@ async function handleOneBotMessage(message) {
 
   const target = decision.target;
   const sessionKey = buildSessionKey(AGENT_ID, target);
-  await enqueueSession(sessionKey, async () => {
+  const dispatch = await enqueueSession(sessionKey, async () => {
     const beforeFile = getSessionFile(sessionKey);
     const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
     const startedAt = Date.now();
     logger.info(`dispatch ${sessionKey} target=${target.kind}:${target.id}`);
     const result = await dispatchToOpenClaw(sessionKey, messageText(decision, message));
     logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
-    await waitAndForwardAssistant(config, target, sessionKey, beforeFile, beforeCursor, startedAt, result?.runId);
+    return { beforeFile, beforeCursor, startedAt, runId: result?.runId };
+  });
+  void waitAndForwardAssistant(config, target, sessionKey, dispatch.beforeFile, dispatch.beforeCursor, dispatch.startedAt, dispatch.runId).catch((error) => {
+    logger.error(`forward assistant failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
   });
 }
 

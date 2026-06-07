@@ -1,9 +1,15 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReplyChunkSender, sendOneBotMessageToCapturedTarget, sendTextToCapturedTarget } from "../src/outbound.js";
 import type { CapturedReplyTarget, OneBotHookConfig, OneBotOutgoingMessage } from "../src/types.js";
 import type { OneBotClient } from "../src/onebot-client.js";
 
-function config(overrides: Partial<OneBotHookConfig["reply"]> = {}): OneBotHookConfig {
+const tempDirs: string[] = [];
+
+function config(overrides: Partial<OneBotHookConfig["reply"]> = {}, fileOverrides: Partial<OneBotHookConfig["files"]> = {}): OneBotHookConfig {
   return {
     enabled: true,
     accountId: "default",
@@ -30,7 +36,34 @@ function config(overrides: Partial<OneBotHookConfig["reply"]> = {}): OneBotHookC
       markdownImages: true,
       maxImagesPerReply: 6,
     },
+    files: {
+      enabled: true,
+      maxFileBytes: 4_294_967_296,
+      detectTextPaths: true,
+      downloadInboundFiles: true,
+      incomingDir: join(tmpdir(), "onebot-incoming-files"),
+      downloadTimeoutMs: 30_000,
+      allowedRoots: [tmpdir()],
+      pathMappings: [],
+      fallbackOnFailure: "text",
+      ...fileOverrides,
+    },
   };
+}
+
+afterEach(async () => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function makeTempFile(name: string, content = "data"): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "onebot-file-test-"));
+  tempDirs.push(dir);
+  const file = join(dir, name);
+  await writeFile(file, content);
+  return file;
 }
 
 describe("ReplyChunkSender", () => {
@@ -295,6 +328,171 @@ describe("ReplyChunkSender", () => {
 
     expect(sends).toEqual([]);
   });
+
+  it("uploads structured file payloads after flushing text", async () => {
+    const file = await makeTempFile("bundle.zip", "zip");
+    const sends: OneBotOutgoingMessage[] = [];
+    const uploads: Array<{ target: CapturedReplyTarget; file: string; name: string }> = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      {
+        sendFile: async (target, part) => {
+          uploads.push({ target, file: part.file, name: part.name });
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver({ content: [{ type: "text", text: "打包好了" }, { type: "file", path: file, name: "skills.zip" }] }, { kind: "final" });
+
+    expect(sends).toEqual(["打包好了"]);
+    expect(uploads).toEqual([{ target: { kind: "private", id: 10001 }, file, name: "skills.zip" }]);
+  });
+
+  it("detects local file paths in assistant text and uploads them once", async () => {
+    const file = await makeTempFile("imagegen-skills.zip", "zip");
+    const uploads: string[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async () => "m1",
+      {},
+      {
+        sendFile: async (_target, part) => {
+          uploads.push(part.file);
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver(`文件在这里：\n${file}\n再说一次 ${file}`, { kind: "final" });
+
+    expect(uploads).toEqual([file]);
+  });
+
+  it("maps host file paths to container-visible upload paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "onebot-file-test-"));
+    tempDirs.push(root);
+    const hostRoot = join(root, "host-workspace");
+    const containerRoot = join(root, "container-workspace");
+    const containerOut = join(containerRoot, "out");
+    mkdirSync(containerOut, { recursive: true });
+    const mappedFile = join(containerOut, "bundle.zip");
+    await writeFile(mappedFile, "zip");
+    const hostPath = join(hostRoot, "out", "bundle.zip");
+    const uploads: string[] = [];
+    const sender = new ReplyChunkSender(
+      config(
+        {},
+        {
+          allowedRoots: [containerRoot],
+          pathMappings: [{ from: hostRoot, to: containerRoot }],
+        }
+      ),
+      { kind: "private", id: 10001 },
+      async () => "m1",
+      {},
+      {
+        sendFile: async (_target, part) => {
+          uploads.push(part.file);
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver({ type: "file", path: hostPath }, { kind: "final" });
+
+    expect(uploads).toEqual([mappedFile]);
+  });
+
+  it("ignores text paths outside allowed roots, directories, and missing files", async () => {
+    const allowedDir = await mkdtemp(join(tmpdir(), "onebot-file-test-"));
+    tempDirs.push(allowedDir);
+    const dirPath = join(allowedDir, "folder");
+    mkdirSync(dirPath);
+    const missing = join(allowedDir, "missing.zip");
+    const outside = join(process.cwd(), "not-allowed.zip");
+    const uploads: string[] = [];
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config({}, { allowedRoots: [allowedDir] }),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      },
+      {},
+      {
+        sendFile: async (_target, part) => {
+          uploads.push(part.file);
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver(`这些不要发：\n${dirPath}\n${missing}\n${outside}`, { kind: "final" });
+
+    expect(uploads).toEqual([]);
+    expect(sends).toEqual([`这些不要发：\n${dirPath}\n${missing}\n${outside}`]);
+  });
+
+  it("falls back to text when a local file exceeds maxFileBytes", async () => {
+    const file = await makeTempFile("too-large.zip", "x");
+    await truncate(file, 4);
+    const sends: OneBotOutgoingMessage[] = [];
+    const uploads: string[] = [];
+    const sender = new ReplyChunkSender(
+      config({}, { maxFileBytes: 3 }),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      },
+      {},
+      {
+        sendFile: async (_target, part) => {
+          uploads.push(part.file);
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver({ type: "file", path: file, name: "too-large.zip" }, { kind: "final" });
+
+    expect(uploads).toEqual([]);
+    expect(String(sends[0])).toContain("文件上传失败：too-large.zip");
+    expect(String(sends[0])).toContain("file exceeds maxFileBytes");
+  });
+
+  it("falls back to text when file upload fails", async () => {
+    const file = await makeTempFile("fail.zip", "zip");
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      },
+      {},
+      {
+        sendFile: async () => {
+          throw new Error("NapCat refused upload");
+        },
+      }
+    );
+
+    await sender.deliver({ type: "file", path: file }, { kind: "final" });
+
+    expect(String(sends[0])).toContain("文件上传失败：fail.zip");
+    expect(String(sends[0])).toContain("NapCat refused upload");
+  });
 });
 
 describe("sendTextToCapturedTarget", () => {
@@ -335,5 +533,43 @@ describe("sendTextToCapturedTarget", () => {
     expect(messageId).toBe("99");
     expect(sendPrivateMsg).toHaveBeenCalledTimes(2);
     expect(sendPrivateMsg).toHaveBeenCalledWith(10001, message);
+  });
+
+  it("retries and uploads files to private targets", async () => {
+    const target: CapturedReplyTarget = { kind: "private", id: 10001 };
+    const uploadPrivateFile = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "failed", retcode: 100, wording: "bad gateway" })
+      .mockResolvedValueOnce({ status: "ok", retcode: 0, data: { file_id: "file-1" } });
+    const client = { uploadPrivateFile } as unknown as OneBotClient;
+    const { sendOneBotFileToCapturedTarget } = await import("../src/outbound.js");
+
+    const messageId = await sendOneBotFileToCapturedTarget(client, config({ maxRetries: 2 }), target, {
+      kind: "file",
+      file: "/tmp/a.zip",
+      name: "a.zip",
+      original: "/tmp/a.zip",
+      size: 3,
+    });
+
+    expect(messageId).toBe("file-1");
+    expect(uploadPrivateFile).toHaveBeenCalledTimes(2);
+    expect(uploadPrivateFile).toHaveBeenCalledWith(10001, "/tmp/a.zip", "a.zip");
+  });
+
+  it("uploads files to group targets", async () => {
+    const uploadGroupFile = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { file_id: "group-file" } });
+    const client = { uploadGroupFile } as unknown as OneBotClient;
+    const { sendOneBotFileToCapturedTarget } = await import("../src/outbound.js");
+
+    const messageId = await sendOneBotFileToCapturedTarget(client, config(), { kind: "group", id: 90001 }, {
+      kind: "file",
+      file: "/tmp/a.zip",
+      name: "a.zip",
+      original: "/tmp/a.zip",
+    });
+
+    expect(messageId).toBe("group-file");
+    expect(uploadGroupFile).toHaveBeenCalledWith(90001, "/tmp/a.zip", "a.zip");
   });
 });

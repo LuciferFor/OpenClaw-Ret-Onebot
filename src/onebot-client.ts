@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import type {
   LoggerLike,
+  OneBotFileData,
+  OneBotFileUploadData,
   OneBotApiResponse,
   OneBotHookConfig,
   OneBotImageData,
@@ -78,8 +80,46 @@ export class OneBotClient extends EventEmitter {
     });
   }
 
+  async uploadPrivateFile(userId: number, file: string, name: string): Promise<OneBotApiResponse<OneBotFileUploadData>> {
+    return this.callApi<OneBotFileUploadData>("upload_private_file", {
+      user_id: userId,
+      file,
+      name,
+    });
+  }
+
+  async uploadGroupFile(groupId: number, file: string, name: string, folder?: string): Promise<OneBotApiResponse<OneBotFileUploadData>> {
+    return this.callApi<OneBotFileUploadData>("upload_group_file", {
+      group_id: groupId,
+      file,
+      name,
+      ...(folder ? { folder } : {}),
+    });
+  }
+
   async getImage(file: string): Promise<OneBotApiResponse<OneBotImageData>> {
     return this.callApi<OneBotImageData>("get_image", { file });
+  }
+
+  async getFile(file: string, type?: string): Promise<OneBotApiResponse<OneBotFileData>> {
+    return this.callApi<OneBotFileData>("get_file", {
+      file,
+      ...(type ? { type } : {}),
+    });
+  }
+
+  async getPrivateFileUrl(fileId: string): Promise<OneBotApiResponse<OneBotFileData>> {
+    return this.callApi<OneBotFileData>("get_private_file_url", {
+      file_id: fileId,
+    });
+  }
+
+  async getGroupFileUrl(groupId: number, fileId: string): Promise<OneBotApiResponse<OneBotFileData>> {
+    return this.callApi<OneBotFileData>("get_group_file_url", {
+      group_id: groupId,
+      group: groupId,
+      file_id: fileId,
+    });
   }
 
   async callApi<T = unknown>(action: string, params: Record<string, unknown>): Promise<OneBotApiResponse<T>> {

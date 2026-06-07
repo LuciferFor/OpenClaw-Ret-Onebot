@@ -34,6 +34,17 @@ function config(overrides: Partial<OneBotHookConfig> = {}): OneBotHookConfig {
       markdownImages: true,
       maxImagesPerReply: 6,
     },
+    files: {
+      enabled: true,
+      maxFileBytes: 4_294_967_296,
+      detectTextPaths: true,
+      downloadInboundFiles: true,
+      incomingDir: "~/.openclaw/workspace/incoming/onebot-files",
+      downloadTimeoutMs: 30_000,
+      allowedRoots: ["~/.openclaw/workspace", "/home/lucifer/.openclaw/workspace", "/home/node/.openclaw/workspace"],
+      pathMappings: [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
+      fallbackOnFailure: "text",
+    },
     ...overrides,
   };
 }

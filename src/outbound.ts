@@ -1,6 +1,8 @@
-import { isAbsolute } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { CapturedReplyTarget, LoggerLike, OneBotHookConfig, OneBotMessageSegment, OneBotOutgoingMessage, OneBotSendData } from "./types.js";
+import { basename, isAbsolute, normalize, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { homedir } from "node:os";
+import { statSync } from "node:fs";
+import type { CapturedReplyTarget, LoggerLike, OneBotFileUploadData, OneBotHookConfig, OneBotMessageSegment, OneBotOutgoingMessage, OneBotSendData } from "./types.js";
 import { collapseDoubleNewlines, markdownToPlain } from "./markdown.js";
 import { isOkResponse, OneBotClient } from "./onebot-client.js";
 
@@ -14,13 +16,30 @@ type ReplyPayload = string | {
   dataUri?: unknown;
   imageUrl?: unknown;
   image_url?: unknown;
+  filePath?: unknown;
+  fileUrl?: unknown;
   url?: unknown;
   file?: unknown;
   path?: unknown;
   source?: unknown;
+  name?: unknown;
+  filename?: unknown;
 };
 
-type ReplyPart = { kind: "text"; text: string; rawText: string } | { kind: "image"; url: string; alt?: string };
+type ReplyPart =
+  | { kind: "text"; text: string; rawText: string }
+  | { kind: "image"; url: string; alt?: string }
+  | ReplyFilePart;
+
+export interface ReplyFilePart {
+  kind: "file";
+  file: string;
+  name: string;
+  original: string;
+  sourceText?: string;
+  size?: number;
+  fallbackReason?: string;
+}
 
 export interface SendAttempt {
   target: CapturedReplyTarget;
@@ -31,10 +50,12 @@ export interface SendAttempt {
 
 export type SendMessageFn = (target: CapturedReplyTarget, message: OneBotOutgoingMessage) => Promise<string>;
 export type SendTextFn = (target: CapturedReplyTarget, text: string) => Promise<string>;
+export type SendFileFn = (target: CapturedReplyTarget, file: ReplyFilePart) => Promise<string>;
 
 export interface ReplyChunkSenderOptions {
   suppressFinalTextAfterToolResult?: boolean;
   forwardToolResultLinks?: boolean;
+  sendFile?: SendFileFn;
 }
 
 export async function sendTextToCapturedTarget(
@@ -76,6 +97,35 @@ export async function sendOneBotMessageToCapturedTarget(
   throw lastError ?? new Error("send failed");
 }
 
+export async function sendOneBotFileToCapturedTarget(
+  client: OneBotClient,
+  config: OneBotHookConfig,
+  target: CapturedReplyTarget,
+  file: ReplyFilePart,
+  logger: LoggerLike = {}
+): Promise<string> {
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= config.reply.maxRetries; attempt += 1) {
+    try {
+      const response = target.kind === "group"
+        ? await client.uploadGroupFile(target.id, file.file, file.name)
+        : await client.uploadPrivateFile(target.id, file.file, file.name);
+      if (!isOkResponse(response)) {
+        throw new Error(response.wording ?? response.message ?? `retcode=${response.retcode ?? "unknown"}`);
+      }
+      const data = response.data as OneBotFileUploadData | undefined;
+      const messageId = data?.message_id ?? data?.file_id ?? data?.file ?? "";
+      logger.info?.(`[onebot-hook] uploaded ${target.kind}:${target.id} file=${file.name} size=${file.size ?? "unknown"} id=${messageId || "(none)"}`);
+      return String(messageId);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      logger.warn?.(`[onebot-hook] file upload attempt ${attempt}/${config.reply.maxRetries} failed for ${target.kind}:${target.id} ${file.name}: ${lastError.message}`);
+      if (attempt < config.reply.maxRetries) await sleep(Math.min(500 * attempt, 2000));
+    }
+  }
+  throw lastError ?? new Error("file upload failed");
+}
+
 export class ReplyChunkSender {
   private textBuffer = "";
   private rawBuffer = "";
@@ -84,6 +134,7 @@ export class ReplyChunkSender {
   private flushChain: Promise<void> = Promise.resolve();
   private imageCount = 0;
   private seenImageUrls = new Set<string>();
+  private seenFiles = new Set<string>();
   private toolResultSeen = false;
   private toolResultOutputSeen = false;
   readonly sent: SendAttempt[] = [];
@@ -124,6 +175,11 @@ export class ReplyChunkSender {
       if (part.kind === "text") {
         this.textBuffer = appendText(this.textBuffer, part.text);
         this.rawBuffer = appendText(this.rawBuffer, part.rawText);
+        continue;
+      }
+
+      if (part.kind === "file") {
+        await this.deliverFilePart(part);
         continue;
       }
 
@@ -181,6 +237,8 @@ export class ReplyChunkSender {
     for (const url of normalizeUrlList(payload.mediaUrls)) parts.push({ kind: "image", url });
     const directImage = imageUrlFromContentItem(payload as Record<string, unknown>);
     if (directImage) parts.push({ kind: "image", url: directImage });
+    const directFile = filePartFromContentItem(payload as Record<string, unknown>, this.config, false);
+    if (directFile) parts.push(directFile);
     return parts;
   }
 
@@ -207,6 +265,8 @@ export class ReplyChunkSender {
       if (imageUrl && isImageContentType(type)) {
         parts.push({ kind: "image", url: imageUrl, alt: stringValue(value.alt) });
       }
+      const file = filePartFromContentItem(value, this.config, false);
+      if (file) parts.push(file);
       if (Array.isArray(value.content)) parts.push(...this.extractContentParts(value.content, opts));
       if (Array.isArray(value.contentItems)) parts.push(...this.extractContentParts(value.contentItems, opts));
     }
@@ -241,6 +301,9 @@ export class ReplyChunkSender {
     const rest = input.slice(lastIndex);
     const text = this.prepareText(rest);
     if (text) parts.push({ kind: "text", text, rawText: rest });
+    if (this.config.files.enabled && this.config.files.detectTextPaths) {
+      parts.push(...filePartsFromText(input, this.config));
+    }
     return parts;
   }
 
@@ -301,6 +364,40 @@ export class ReplyChunkSender {
     if (!this.options.suppressFinalTextAfterToolResult) return false;
     return this.toolResultSeen;
   }
+
+  private async deliverFilePart(part: ReplyFilePart): Promise<void> {
+    if (!this.config.files.enabled) return;
+    const key = `${part.file}\n${part.name}`;
+    if (this.seenFiles.has(key)) {
+      this.logger.debug?.("[onebot-hook] outbound file skipped: duplicate file source");
+      return;
+    }
+    this.seenFiles.add(key);
+    await this.queueFlush();
+    const sendFile = this.options.sendFile;
+    if (part.fallbackReason || !sendFile) {
+      await this.sendFileFallback(part, part.fallbackReason ?? "file upload function is unavailable");
+      return;
+    }
+    try {
+      const messageId = await sendFile(this.target, part);
+      this.sent.push({ target: this.target, text: summarizeReplyParts([part]), message: `[file:${part.name}]`, messageId });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await this.sendFileFallback(part, reason);
+    }
+  }
+
+  private async sendFileFallback(part: ReplyFilePart, reason: string): Promise<void> {
+    const message = [
+      `文件上传失败：${part.name}`,
+      `路径：${part.original}`,
+      part.size == null ? undefined : `大小：${formatBytes(part.size)}`,
+      `原因：${reason}`,
+    ].filter((item): item is string => Boolean(item)).join("\n");
+    const messageId = await this.sendMessage(this.target, message);
+    this.sent.push({ target: this.target, text: message, message, messageId });
+  }
 }
 
 function replyPartsToOneBotMessage(parts: ReplyPart[]): OneBotOutgoingMessage {
@@ -313,6 +410,7 @@ function replyPartsToOneBotMessage(parts: ReplyPart[]): OneBotOutgoingMessage {
       if (part.text) segments.push({ type: "text", data: { text: part.text } });
       continue;
     }
+    if (part.kind === "file") continue;
     segments.push({ type: "image", data: { file: normalizeOutboundImageSource(part.url), ...(part.alt ? { summary: part.alt } : {}) } });
   }
   return segments;
@@ -320,7 +418,8 @@ function replyPartsToOneBotMessage(parts: ReplyPart[]): OneBotOutgoingMessage {
 
 function isNoReply(parts: ReplyPart[]): boolean {
   const hasImage = parts.some((part) => part.kind === "image");
-  if (hasImage) return false;
+  const hasFile = parts.some((part) => part.kind === "file");
+  if (hasImage || hasFile) return false;
   const raw = parts.filter((part) => part.kind === "text").map((part) => part.rawText).join("").trim();
   return !raw || raw === "NO_REPLY" || raw.endsWith("NO_REPLY");
 }
@@ -335,21 +434,193 @@ function normalizeUrlList(value: unknown): string[] {
 }
 
 function imageUrlFromContentItem(value: Record<string, unknown>): string | undefined {
+  const type = stringValue(value.type);
+  if (isFileContentType(type)) return undefined;
   const direct =
     stringValue(value.url) ??
     stringValue(value.imageUrl) ??
-    stringValue(value.file) ??
-    stringValue(value.path) ??
-    stringValue(value.source) ??
     stringValue(value.mediaUrl) ??
     stringValue(value.dataUri);
   if (direct) return normalizeOutboundImageSource(direct);
+  if (isImageContentType(type) && type) {
+    const imageFileSource = stringValue(value.file) ?? stringValue(value.path) ?? stringValue(value.source);
+    if (imageFileSource) return normalizeOutboundImageSource(imageFileSource);
+  }
   const camelImageUrl = value.imageUrl;
   if (camelImageUrl && typeof camelImageUrl === "object") return normalizeOutboundImageSource(stringValue((camelImageUrl as Record<string, unknown>).url));
   const imageUrl = value.image_url;
   if (typeof imageUrl === "string") return normalizeOutboundImageSource(imageUrl);
   if (imageUrl && typeof imageUrl === "object") return normalizeOutboundImageSource(stringValue((imageUrl as Record<string, unknown>).url));
   return undefined;
+}
+
+function filePartFromContentItem(value: Record<string, unknown>, config: OneBotHookConfig, fromText: boolean): ReplyFilePart | undefined {
+  if (!config.files.enabled) return undefined;
+  const type = stringValue(value.type);
+  if (type && !isFileContentType(type)) return undefined;
+  const source =
+    stringValue(value.filePath) ??
+    stringValue(value.fileUrl) ??
+    stringValue(value.path) ??
+    stringValue(value.file) ??
+    (isFileContentType(type) ? stringValue(value.url) ?? stringValue(value.source) : undefined);
+  if (!source) return undefined;
+  const name = stringValue(value.name) ?? stringValue(value.filename);
+  return filePartFromSource(source, name, config, fromText);
+}
+
+function filePartsFromText(input: string, config: OneBotHookConfig): ReplyFilePart[] {
+  if (!config.files.enabled || !config.files.detectTextPaths) return [];
+  const parts: ReplyFilePart[] = [];
+  const seen = new Set<string>();
+  const pattern = /(^|[\s(["'：:])((?:\/[^\s`"'<>]+|[A-Za-z]:\\[^\s`"'<>]+))/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(input)) !== null) {
+    const source = trimPathCandidate(match[2]);
+    const part = filePartFromSource(source, undefined, config, true);
+    if (!part) continue;
+    const key = `${part.file}\n${part.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parts.push(part);
+  }
+  return parts;
+}
+
+function filePartFromSource(source: string, name: string | undefined, config: OneBotHookConfig, fromText: boolean): ReplyFilePart | undefined {
+  const normalizedSource = normalizeFileSource(source);
+  if (!normalizedSource) return undefined;
+  if (/^https?:\/\//i.test(normalizedSource)) {
+    if (fromText) return undefined;
+    return { kind: "file", file: normalizedSource, name: name ?? inferFileName(normalizedSource), original: source, sourceText: source };
+  }
+  if (!isAbsolute(normalizedSource)) {
+    return fromText ? undefined : fileFallback(source, name, "file path is not absolute");
+  }
+
+  const candidates = localFileCandidates(normalizedSource, config);
+  let allowedCandidateSeen = false;
+  for (const candidate of candidates) {
+    if (!isAllowedLocalFilePath(candidate, config)) continue;
+    allowedCandidateSeen = true;
+    let info;
+    try {
+      info = statSync(candidate);
+    } catch {
+      continue;
+    }
+    if (!info.isFile()) {
+      return fromText ? undefined : fileFallback(source, name, "path is not a regular file");
+    }
+    if (info.size > config.files.maxFileBytes) {
+      return {
+        kind: "file",
+        file: candidate,
+        name: name ?? inferFileName(source),
+        original: source,
+        sourceText: source,
+        size: info.size,
+        fallbackReason: `file exceeds maxFileBytes (${config.files.maxFileBytes})`,
+      };
+    }
+    return {
+      kind: "file",
+      file: candidate,
+      name: name ?? inferFileName(source),
+      original: source,
+      sourceText: source,
+      size: info.size,
+    };
+  }
+
+  if (fromText) return undefined;
+  return fileFallback(source, name, allowedCandidateSeen ? "file does not exist" : "file is outside allowed roots");
+}
+
+function fileFallback(source: string, name: string | undefined, reason: string): ReplyFilePart {
+  return {
+    kind: "file",
+    file: source,
+    name: name ?? inferFileName(source),
+    original: source,
+    sourceText: source,
+    fallbackReason: reason,
+  };
+}
+
+function normalizeFileSource(source: string): string | undefined {
+  const value = source.trim();
+  if (!value) return undefined;
+  if (/^file:\/\//i.test(value)) {
+    try {
+      return fileURLToPath(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (/^https?:\/\//i.test(value)) return value;
+  return expandHome(value);
+}
+
+function localFileCandidates(source: string, config: OneBotHookConfig): string[] {
+  const base = normalize(resolve(expandHome(source)));
+  const candidates = [base];
+  for (const mapping of config.files.pathMappings) {
+    const from = normalize(resolve(expandHome(mapping.from)));
+    const to = normalize(resolve(expandHome(mapping.to)));
+    if (!pathStartsWith(base, from)) continue;
+    const suffix = base === from ? "" : base.slice(from.length);
+    candidates.push(normalize(`${to}${suffix}`));
+  }
+  return [...new Set(candidates)];
+}
+
+function isAllowedLocalFilePath(file: string, config: OneBotHookConfig): boolean {
+  const normalizedFile = normalize(resolve(expandHome(file)));
+  return config.files.allowedRoots.some((root) => pathStartsWith(normalizedFile, normalize(resolve(expandHome(root)))));
+}
+
+function pathStartsWith(value: string, root: string): boolean {
+  const lhs = normalize(value);
+  const rhs = normalize(root);
+  const same = process.platform === "win32" ? lhs.toLowerCase() === rhs.toLowerCase() : lhs === rhs;
+  if (same) return true;
+  const prefix = rhs.endsWith(sep) ? rhs : `${rhs}${sep}`;
+  return process.platform === "win32" ? lhs.toLowerCase().startsWith(prefix.toLowerCase()) : lhs.startsWith(prefix);
+}
+
+function expandHome(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) return `${homedir()}${value.slice(1)}`;
+  return value;
+}
+
+function inferFileName(source: string): string {
+  try {
+    if (/^https?:\/\//i.test(source)) {
+      const name = basename(new URL(source).pathname);
+      if (name) return name;
+    }
+    if (/^file:\/\//i.test(source)) return basename(fileURLToPath(source)) || "file";
+  } catch {
+    // Fall through to path basename.
+  }
+  return basename(trimPathCandidate(source)) || "file";
+}
+
+function trimPathCandidate(value: string): string {
+  return value.trim().replace(/[.,，。;；!！?？)\]】》]+$/u, "");
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value}B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  for (const unit of units) {
+    if (size < 1024) return `${Number(size.toFixed(size >= 10 ? 1 : 2))}${unit}`;
+    size /= 1024;
+  }
+  return `${Number(size.toFixed(2))}PB`;
 }
 
 export function normalizeOutboundImageSource(value: string | undefined): string | undefined {
@@ -365,6 +636,10 @@ function isImageContentType(type: string | undefined): boolean {
   return !type || type === "image" || type === "image_url" || type === "input_image" || type === "inputImage" || type === "output_image";
 }
 
+function isFileContentType(type: string | undefined): boolean {
+  return type === "file" || type === "attachment" || type === "output_file";
+}
+
 function isToolInfo(info: { kind?: string }): boolean {
   return (info.kind ?? "").toLowerCase().includes("tool");
 }
@@ -376,7 +651,7 @@ function hasUsefulLink(text: string): boolean {
 function finalImageOrLinkParts(parts: ReplyPart[]): ReplyPart[] {
   const filtered: ReplyPart[] = [];
   for (const part of parts) {
-    if (part.kind === "image") {
+    if (part.kind === "image" || part.kind === "file") {
       filtered.push(part);
       continue;
     }
@@ -389,7 +664,11 @@ function finalImageOrLinkParts(parts: ReplyPart[]): ReplyPart[] {
 }
 
 function summarizeReplyParts(parts: ReplyPart[]): string {
-  return parts.map((part) => part.kind === "text" ? part.text : `[image:${part.url}]`).join("");
+  return parts.map((part) => {
+    if (part.kind === "text") return part.text;
+    if (part.kind === "image") return `[image:${part.url}]`;
+    return `[file:${part.name}]`;
+  }).join("");
 }
 
 function describeOutgoingMessage(message: OneBotOutgoingMessage): string {

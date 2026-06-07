@@ -12,6 +12,7 @@ import type { OneBotHookConfig, OneBotMessageEvent, OpenClawPluginApi } from "..
 const tempDirs: string[] = [];
 
 function config(mediaOverrides: Partial<OneBotHookConfig["media"]> = {}): OneBotHookConfig {
+  const incomingDir = tempDirs[0] ? join(tempDirs[0], "incoming") : "~/.openclaw/workspace/incoming/onebot-files";
   return {
     enabled: true,
     accountId: "default",
@@ -31,6 +32,17 @@ function config(mediaOverrides: Partial<OneBotHookConfig["media"]> = {}): OneBot
       markdownImages: true,
       maxImagesPerReply: 6,
       ...mediaOverrides,
+    },
+    files: {
+      enabled: true,
+      maxFileBytes: 4_294_967_296,
+      detectTextPaths: true,
+      downloadInboundFiles: true,
+      incomingDir,
+      downloadTimeoutMs: 10_000,
+      allowedRoots: ["~/.openclaw/workspace", "/home/lucifer/.openclaw/workspace", "/home/node/.openclaw/workspace"],
+      pathMappings: [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
+      fallbackOnFailure: "text",
     },
   };
 }
@@ -267,6 +279,44 @@ describe("processInboundMessage integration", () => {
 
     expect(dispatcher).toHaveBeenCalledTimes(1);
     expect(sendPrivateMsg).toHaveBeenCalledWith(10001, "saw it");
+  });
+
+  it("passes downloaded inbound file paths through OpenClaw payload fields", async () => {
+    const tempDir = await makeTempDir();
+    const cfg = config();
+    const sendPrivateMsg = vi.fn().mockResolvedValue({ status: "ok", retcode: 0, data: { message_id: 6 } });
+    const getFile = vi.fn().mockResolvedValue({
+      status: "ok",
+      retcode: 0,
+      data: { url: "base64://emlw", file_name: "bundle.zip", mime: "application/zip" },
+    });
+    const client = { getFile, sendPrivateMsg } as unknown as OneBotClient;
+    const dispatcher = vi.fn(async ({ ctx, dispatcherOptions }) => {
+      expect(ctx.BodyForAgent).toContain("[file: bundle.zip]");
+      expect(ctx.BodyForAgent).toContain("[path:");
+      expect(ctx.FilePath).toEqual(expect.stringContaining(join(tempDir, "incoming")));
+      expect(ctx.FilePaths).toEqual([ctx.FilePath]);
+      expect(ctx.FileName).toBe("bundle.zip");
+      expect(ctx.Body.content).toEqual([
+        expect.objectContaining({ type: "file", path: ctx.FilePath, filename: "bundle.zip" }),
+      ]);
+      expect(ctx._onebot.mediaParts).toEqual([
+        expect.objectContaining({ kind: "file", downloadStatus: "saved", localPath: ctx.FilePath }),
+      ]);
+      await dispatcherOptions.deliver("装好了", { kind: "final" });
+    });
+
+    await processInboundMessage(api(dispatcher), client, cfg, {
+      post_type: "message",
+      message_type: "private",
+      self_id: 42,
+      user_id: 10001,
+      message: [{ type: "file", data: { file_id: "fid-1", name: "bundle.zip" } }],
+    });
+
+    expect(dispatcher).toHaveBeenCalledTimes(1);
+    expect(getFile).toHaveBeenCalledWith("fid-1", "private");
+    expect(sendPrivateMsg).toHaveBeenCalledWith(10001, "装好了");
   });
 
   it("dispatches mentioned group image messages and sends image replies to the captured group target", async () => {

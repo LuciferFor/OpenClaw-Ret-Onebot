@@ -1,4 +1,4 @@
-import type { OneBotHookConfig, OneBotMediaConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
+import type { OneBotFileConfig, OneBotFilePathMapping, OneBotHookConfig, OneBotMediaConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
 
 const DEFAULT_WS_PATH = "/onebot/v11/ws";
 
@@ -14,6 +14,19 @@ function asStringArray(value: unknown): string[] {
 function asNumber(value: unknown, fallback: number, min: number, max: number): number {
   const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
   return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function asPathMappings(value: unknown): OneBotFilePathMapping[] {
+  if (!Array.isArray(value)) return [];
+  const mappings: OneBotFilePathMapping[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const raw = item as Record<string, unknown>;
+    const from = asString(raw.from);
+    const to = asString(raw.to);
+    if (from && to) mappings.push({ from, to });
+  }
+  return mappings;
 }
 
 function normalizeWsConfig(raw: any): OneBotWsConfig {
@@ -60,6 +73,24 @@ function normalizeMediaConfig(raw: any): OneBotMediaConfig {
   };
 }
 
+function normalizeFileConfig(raw: any): OneBotFileConfig {
+  return {
+    enabled: raw?.enabled === undefined ? true : Boolean(raw.enabled),
+    maxFileBytes: asNumber(raw?.maxFileBytes, 4_294_967_296, 1, Number.MAX_SAFE_INTEGER),
+    detectTextPaths: raw?.detectTextPaths === undefined ? true : Boolean(raw.detectTextPaths),
+    downloadInboundFiles: raw?.downloadInboundFiles === undefined ? true : Boolean(raw.downloadInboundFiles),
+    incomingDir: asString(raw?.incomingDir) ?? "~/.openclaw/workspace/incoming/onebot-files",
+    downloadTimeoutMs: asNumber(raw?.downloadTimeoutMs, 30_000, 100, 10 * 60_000),
+    allowedRoots: asStringArray(raw?.allowedRoots).length
+      ? asStringArray(raw.allowedRoots)
+      : ["~/.openclaw/workspace", "/home/lucifer/.openclaw/workspace", "/home/node/.openclaw/workspace"],
+    pathMappings: asPathMappings(raw?.pathMappings).length
+      ? asPathMappings(raw.pathMappings)
+      : [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
+    fallbackOnFailure: "text",
+  };
+}
+
 export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): OneBotHookConfig | null {
   const root = apiOrConfig?.config ?? apiOrConfig ?? {};
   const channel = root?.channels?.onebot;
@@ -79,6 +110,7 @@ export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): On
     denyFrom: asStringArray(raw.denyFrom).map(normalizePeerRef),
     reply: normalizeReplyConfig(raw.reply),
     media: normalizeMediaConfig(raw.media),
+    files: normalizeFileConfig(raw.files),
   };
 }
 

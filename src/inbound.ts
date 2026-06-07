@@ -10,7 +10,7 @@ import {
   summarizeMediaParts,
 } from "./media.js";
 import { isOkResponse, OneBotClient } from "./onebot-client.js";
-import { ReplyChunkSender, sendOneBotMessageToCapturedTarget, type ReplyChunkSenderOptions } from "./outbound.js";
+import { ReplyChunkSender, sendOneBotFileToCapturedTarget, sendOneBotMessageToCapturedTarget, type ReplyChunkSenderOptions } from "./outbound.js";
 import type {
   CapturedReplyTarget,
   InboundMessagePart,
@@ -140,6 +140,25 @@ export async function processInboundMessage(
       throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
     }
     return response?.data ?? { file: part.file };
+  }, async (part) => {
+    const fileId = part.fileId ?? part.file;
+    if (!fileId) return undefined;
+
+    if (part.fileId) {
+      const urlResponse = target.kind === "group" && typeof (client as any).getGroupFileUrl === "function"
+        ? await (client as any).getGroupFileUrl(target.id, part.fileId)
+        : target.kind === "private" && typeof (client as any).getPrivateFileUrl === "function"
+          ? await (client as any).getPrivateFileUrl(part.fileId)
+          : undefined;
+      if (urlResponse && isOkResponse(urlResponse) && urlResponse.data) return urlResponse.data;
+    }
+
+    if (typeof (client as any).getFile !== "function") return undefined;
+    const response = await (client as any).getFile(fileId, target.kind);
+    if (!response || !isOkResponse(response)) {
+      throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+    }
+    return response?.data ?? { file: part.file, file_id: part.fileId };
   });
   const content = buildOpenClawContent(preparedParts);
   const mediaPayload = buildAgentMediaPayloadFromParts(preparedParts);
@@ -203,6 +222,7 @@ export async function processInboundMessage(
     replyOptions.suppressFinalTextAfterToolResult = true;
     replyOptions.forwardToolResultLinks = true;
   }
+  replyOptions.sendFile = (captured, file) => sendOneBotFileToCapturedTarget(client, config, captured, file, logger);
 
   const chunkSender = new ReplyChunkSender(
     config,

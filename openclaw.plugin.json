@@ -178,6 +178,64 @@
               }
             },
             "description": "Inbound image caching and outbound OneBot media segment settings."
+          },
+          "files": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "maxFileBytes": {
+                "type": "number",
+                "default": 4294967296
+              },
+              "detectTextPaths": {
+                "type": "boolean",
+                "default": true
+              },
+              "downloadInboundFiles": {
+                "type": "boolean",
+                "default": true
+              },
+              "incomingDir": {
+                "type": "string",
+                "default": "~/.openclaw/workspace/incoming/onebot-files"
+              },
+              "downloadTimeoutMs": {
+                "type": "number",
+                "default": 30000
+              },
+              "allowedRoots": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": ["~/.openclaw/workspace", "/home/lucifer/.openclaw/workspace", "/home/node/.openclaw/workspace"]
+              },
+              "pathMappings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                  }
+                },
+                "default": [
+                  {
+                    "from": "/home/lucifer/.openclaw/workspace",
+                    "to": "/home/node/.openclaw/workspace"
+                  }
+                ]
+              },
+              "fallbackOnFailure": {
+                "type": "string",
+                "enum": ["text"],
+                "default": "text"
+              }
+            },
+            "description": "Inbound file download cache and outbound file upload settings."
           }
         }
       },

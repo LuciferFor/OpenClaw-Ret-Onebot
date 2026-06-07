@@ -75,7 +75,9 @@ After=network-online.target docker.service
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/bin/docker exec $container sh -lc "/usr/bin/pkill -9 -f 'node .*openclaw-onebot-sidecar.mjs' || true"
 ExecStart=/usr/bin/docker exec $container node $sidecarContainerPath
+ExecStopPost=-/usr/bin/docker exec $container sh -lc "/usr/bin/pkill -9 -f 'node .*openclaw-onebot-sidecar.mjs' || true"
 Restart=always
 RestartSec=3
 
@@ -105,7 +107,10 @@ WantedBy=multi-user.target
     "ONEBOT_WS_PACKAGE",
     "ONEBOT_SIDECAR_WS_URL",
     "ONEBOT_SIDECAR_HTTP_URL",
+    "ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS",
+    "ONEBOT_ASSISTANT_MAX_WAIT_MS",
     "ONEBOT_ASSISTANT_TIMEOUT_MS",
+    "ONEBOT_ASSISTANT_CATCHUP_SCAN_MS",
     "ONEBOT_ASSISTANT_SETTLE_MS"
   )
   $envLines = @("Environment=HOME=/home/$serviceUser")

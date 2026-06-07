@@ -10,7 +10,9 @@
 - 不依赖 agent、skills、tool 自己调用 OneBot 发消息接口。
 - OpenClaw gateway token 优先从 `OPENCLAW_GATEWAY_TOKEN` 读取；没有则从 `OPENCLAW_CONFIG_PATH` 指向的 `openclaw.json` 读取 `gateway.auth.token`。
 - sidecar 已兼容 OpenClaw `connect.challenge` 握手。
-- 出站等待默认 `ONEBOT_ASSISTANT_TIMEOUT_MS=60000`，超时且没有 assistant 回复时会 `sessions.abort` 释放卡住的 run。
+- 出站等待默认 `ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=180000`、`ONEBOT_ASSISTANT_MAX_WAIT_MS=600000`、`ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000`。有工具调用/工具结果等 session 进展时会继续等；每 3 秒会 catch-up 扫描当前 session 文件，防止增量 cursor 漏读；完全无进展超时且没有 assistant 回复时才 `sessions.abort` 释放卡住的 run。
+- 出站文件默认开启：结构化 `file/path/fileUrl` 和 assistant 文本里的 allowlist 本地路径会走 OneBot `upload_private_file` / `upload_group_file`；默认上限 4GiB，失败时发路径、大小和原因文本。
+- 入站文件默认开启：OneBot `file` segment 会优先使用事件 URL，其次尝试 `get_private_file_url` / `get_group_file_url` / `get_file`，保存到 `~/.openclaw/workspace/incoming/onebot-files`，并把真实路径写入 OpenClaw `FilePath`、`FilePaths` 和 prompt 的 `[path: ...]` 行。
 - 插件进程内 service 默认不连接 OneBot，避免和 sidecar 双路回复；只有显式设置 `ONEBOT_HOOK_INPROCESS_SERVICE=1` 才启用。
 
 ## 部署脚本
@@ -51,7 +53,9 @@ After=network-online.target docker.service
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/bin/docker exec openclaw-openclaw-gateway-1 sh -lc "/usr/bin/pkill -9 -f 'node .*openclaw-onebot-sidecar.mjs' || true"
 ExecStart=/usr/bin/docker exec openclaw-openclaw-gateway-1 node /home/node/.openclaw/workspace/tools/onebot/openclaw-onebot-sidecar.mjs
+ExecStopPost=-/usr/bin/docker exec openclaw-openclaw-gateway-1 sh -lc "/usr/bin/pkill -9 -f 'node .*openclaw-onebot-sidecar.mjs' || true"
 Restart=always
 RestartSec=3
 
@@ -78,7 +82,10 @@ docker exec openclaw-openclaw-gateway-1 sh -lc 'node -v && ls -la /home/node/.op
 31.11 曾出现的问题：
 
 - OpenClaw session `embedded_run` 长时间 stalled，旧 sidecar 会等 4 分钟。
-- 已修为 60 秒超时并主动 `sessions.abort`。
+- 已修为无进展超时并主动 `sessions.abort`，默认 180 秒无进展、最长 10 分钟。
+- Docker `docker exec` 重启时容器内可能残留旧 sidecar node 进程；service 已加 `ExecStartPre` / `ExecStopPost` 清理 `openclaw-onebot-sidecar.mjs`。
+- Docker 容器内上传宿主机工作区文件时，`channels.onebot.files.pathMappings` 默认把 `/home/lucifer/.openclaw/workspace` 映射到 `/home/node/.openclaw/workspace`。
+- Docker 容器内接收 QQ 文件时，入站文件落在 `/home/node/.openclaw/workspace/incoming/onebot-files`。如果 NapCat 只返回宿主机本地路径且容器不可见，日志会记录 `inbound file download failed`，需要优先让 OneBot 返回 URL。
 - sidecar 与 in-process 插件 service 同时运行时会重复回复。当前版本默认关闭 in-process service，只保留 sidecar。
 - 如果 QQ 收不到但 OpenClaw 有回复，优先查 sidecar journal 的 `forwarded assistant message`、`sent private/group`、`assistant timeout`。
 
@@ -119,7 +126,10 @@ Environment=OPENCLAW_TRUSTED_USER=lan@openclaw.local
 Environment=ONEBOT_AGENT_ID=main
 Environment=ONEBOT_WS_PACKAGE=/home/lucifer/.openclaw/plugins/openclaw-onebot-hook/node_modules/ws
 Environment=ONEBOT_SIDECAR_WS_URL=ws://127.0.0.1:3001
-Environment=ONEBOT_ASSISTANT_TIMEOUT_MS=60000
+Environment=ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=180000
+Environment=ONEBOT_ASSISTANT_MAX_WAIT_MS=600000
+Environment=ONEBOT_ASSISTANT_TIMEOUT_MS=180000
+Environment=ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000
 Environment=ONEBOT_ASSISTANT_SETTLE_MS=2000
 ExecStart=/home/lucifer/.openclaw/tools/node-v22.22.0/bin/node /home/lucifer/.openclaw/workspace/tools/onebot/openclaw-onebot-sidecar.mjs
 Restart=always
@@ -151,6 +161,11 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - sidecar 初次部署时缺 OpenClaw gateway token，日志为 `unauthorized: gateway token missing`，导致 QQ 入站收到但没有进 OpenClaw。
 - 31.9 gateway 会先发 `connect.challenge`，sidecar 必须等待 challenge 后带 `auth: { token }` 发 `connect`。
 - `3002` 是旧 group filter 的单连接代理，旧 channel 和 sidecar 同时连接会互相顶；sidecar 已改为 `ONEBOT_SIDECAR_WS_URL=ws://127.0.0.1:3001` 直连 NapCat。
+- 2026-06-06 18:01 与 21:00 的私聊触发了 Bash/Cron 工具，但工具结果刚写入时撞上 60 秒超时，run 被 sidecar abort，导致没有 final 回复。当前 sidecar 已改成“先读取 session 再判断超时”的无进展等待，默认 180 秒无进展、最长 10 分钟，工具仍在进展时不会立刻 abort。
+- 2026-06-06 23:47 与 23:51 的群聊 OpenClaw 已经写出 assistant，但 sidecar 增量 cursor 没读到，最终误判超时。当前 sidecar 增加每 3 秒 catch-up 扫描当前 session 文件，发现 startedAt 之后的 assistant 会补发。
+- 2026-06-07 14:00 的连续私聊里，OpenClaw reset/切换了 session 文件，sidecar 仍盯旧文件导致第一条有 OpenClaw 回复但 QQ 没收到；第二条被同会话队列压到第一条超时后才送入 OpenClaw。当前 sidecar 会动态刷新 session 文件路径，并且同会话只串行 `sessions.send`，不再把后续入站消息卡到上一轮回复等待结束之后。
+- 2026-06-07 14:15 的 zip 附件只在 OpenClaw 文本里显示路径，没有发到 QQ。当前 hook 已支持文件上传，文本中 allowlist 路径如 `/home/lucifer/.openclaw/workspace/out/*.zip` 会被识别并上传；上传失败会发文本兜底。
+- 2026-06-07 15:40 的 QQ zip 入站只变成 `[file: xxx.zip]` 占位，OpenClaw 拿不到内容。当前 hook 已支持入站文件下载落盘，成功后 OpenClaw 会看到 `/home/.../.openclaw/workspace/incoming/onebot-files/...zip`。
 
 ## 新机器迁移清单
 
@@ -168,4 +183,6 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - QQ 消息没有出现在 sidecar journal：OneBot WS 没连上，查 `ONEBOT_SIDECAR_WS_URL`、access token、NapCat 在线状态。
 - sidecar journal 有 `dispatch`，OpenClaw 里没有消息：查 gateway token、`connect.challenge`、`sessions.send` 错误。
 - OpenClaw 有 assistant 回复，QQ 没收到：查 OneBot HTTP、`send_private_msg` / `send_group_msg` 错误和 sidecar `sent private/group` 日志。
-- 只有等很久才回复：查 OpenClaw `stalled session`，sidecar 应在 60 秒超时后 abort。
+- OpenClaw 回复里有本地文件路径但 QQ 没附件：查 `channels.onebot.files.allowedRoots`、`pathMappings`、文件是否真实存在，以及 sidecar journal 的 `uploaded ... file=` 或 `文件上传失败`。
+- QQ 发了文件但 OpenClaw 只看到文件名：查 sidecar journal 的 `inbound file download failed`，以及 `channels.onebot.files.downloadInboundFiles`、`incomingDir`、`maxFileBytes`、OneBot `get_file` / 文件 URL 是否可用。
+- 只有等很久才回复：查 OpenClaw `stalled session`，sidecar 应在 180 秒无进展后 abort。
