@@ -31,8 +31,9 @@ const logger = {
 
 const importFromPlugin = async (relativePath) => import(pathToFileURL(path.join(PLUGIN_ROOT, relativePath)).href);
 const { getOneBotHookConfig } = await importFromPlugin("dist/config.js");
-const { MessageDeduper, OneBotClient } = await importFromPlugin("dist/onebot-client.js");
+const { MessageDeduper, OneBotClient, isOkResponse } = await importFromPlugin("dist/onebot-client.js");
 const { decideInbound, buildSessionKey } = await importFromPlugin("dist/inbound.js");
+const { prepareInboundMediaParts, partsToText } = await importFromPlugin("dist/media.js");
 const { ReplyChunkSender, sendOneBotFileToCapturedTarget, sendOneBotMessageToCapturedTarget } = await importFromPlugin("dist/outbound.js");
 
 let stopping = false;
@@ -264,13 +265,69 @@ function deliveredAssistantIds(sessionKey) {
   return ids;
 }
 
-function messageText(decision, message) {
-  const text = decision.promptText || decision.text;
+function messageText(decision, message, preparedText) {
+  const text = preparedText || decision.promptText || decision.text;
   if (decision.target?.kind === "group") {
     const name = message.sender?.card || message.sender?.nickname || message.user_id || "unknown";
     return `${name}: ${text}`;
   }
   return text;
+}
+
+async function prepareInboundPromptText(config, decision, message, target) {
+  const client = currentClient ?? new OneBotClient(config, logger);
+  const preparedParts = await prepareInboundMediaParts(
+    decision.parts,
+    config,
+    logger,
+    async (file, part) => {
+      if (typeof client.getImage !== "function") return undefined;
+      const response = await client.getImage(file);
+      if (!response || !isOkResponse(response)) {
+        throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+      }
+      return response?.data ?? { file: part.file };
+    },
+    async (part) => resolveOneBotInboundFile(client, target, part),
+  );
+  logPreparedInboundFiles(preparedParts, target);
+  return partsToText(preparedParts, { includeMedia: true }) || decision.promptText || decision.text;
+}
+
+async function resolveOneBotInboundFile(client, target, part) {
+  const fileId = part.fileId ?? part.file;
+  if (!fileId) return undefined;
+
+  if (part.fileId) {
+    const urlResponse =
+      target.kind === "group" && typeof client.getGroupFileUrl === "function"
+        ? await client.getGroupFileUrl(target.id, part.fileId)
+        : target.kind === "private" && typeof client.getPrivateFileUrl === "function"
+          ? await client.getPrivateFileUrl(part.fileId)
+          : undefined;
+    if (urlResponse && isOkResponse(urlResponse) && urlResponse.data) return urlResponse.data;
+  }
+
+  if (typeof client.getFile !== "function") return undefined;
+  const response = await client.getFile(fileId, target.kind);
+  if (!response || !isOkResponse(response)) {
+    throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+  }
+  return response?.data ?? { file: part.file, file_id: part.fileId };
+}
+
+function logPreparedInboundFiles(parts, target) {
+  for (const part of parts) {
+    if (part?.kind !== "file") continue;
+    const name = part.filename || part.file || part.fileId || "file";
+    if (part.downloadStatus === "saved") {
+      logger.info(`inbound file saved ${target.kind}:${target.id} file=${name} path=${part.localPath} size=${part.size ?? "unknown"}`);
+    } else if (part.downloadStatus === "failed") {
+      logger.warn(`inbound file failed ${target.kind}:${target.id} file=${name} reason=${part.downloadError || "unknown"}`);
+    } else {
+      logger.debug(`inbound file skipped ${target.kind}:${target.id} file=${name} reason=${part.downloadError || part.downloadStatus || "unknown"}`);
+    }
+  }
 }
 
 async function dispatchToOpenClaw(sessionKey, text) {
@@ -417,12 +474,13 @@ async function handleOneBotMessage(message) {
 
   const target = decision.target;
   const sessionKey = buildSessionKey(AGENT_ID, target);
+  const preparedText = await prepareInboundPromptText(config, decision, message, target);
   const dispatch = await enqueueSession(sessionKey, async () => {
     const beforeFile = getSessionFile(sessionKey);
     const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
     const startedAt = Date.now();
     logger.info(`dispatch ${sessionKey} target=${target.kind}:${target.id}`);
-    const result = await dispatchToOpenClaw(sessionKey, messageText(decision, message));
+    const result = await dispatchToOpenClaw(sessionKey, messageText(decision, message, preparedText));
     logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
     return { beforeFile, beforeCursor, startedAt, runId: result?.runId };
   });
