@@ -200,6 +200,26 @@ function getSessionFile(sessionKey) {
   return typeof file === "string" && file ? file : null;
 }
 
+function getSessionMeta(sessionKey) {
+  const sessions = readJson(SESSIONS_PATH, {});
+  const meta = sessions?.[sessionKey];
+  return meta && typeof meta === "object" ? meta : null;
+}
+
+function getPendingFinalDeliveryText(sessionKey, startedAt) {
+  const meta = getSessionMeta(sessionKey);
+  const text = meta?.pendingFinalDeliveryText;
+  if (typeof text !== "string" || !text.trim()) return "";
+  const createdAt = Number(meta?.pendingFinalDeliveryCreatedAt ?? meta?.updatedAt ?? 0);
+  if (Number.isFinite(createdAt) && createdAt && createdAt + 1000 < startedAt) return "";
+  return text.trim();
+}
+
+function trajectoryFileForSessionFile(file) {
+  if (!file || typeof file !== "string" || !file.endsWith(".jsonl")) return null;
+  return file.slice(0, -".jsonl".length) + ".trajectory.jsonl";
+}
+
 function fileSize(file) {
   try {
     return fs.statSync(file).size;
@@ -360,6 +380,20 @@ async function sendAssistantEntry(config, target, entry) {
   await sender.finish();
 }
 
+async function sendAssistantText(config, target, text) {
+  const sender = new ReplyChunkSender(
+    config,
+    target,
+    (captured, outgoing) => sendOneBotMessageToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, outgoing, logger),
+    logger,
+    {
+      sendFile: (captured, file) => sendOneBotFileToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, file, logger),
+    },
+  );
+  await sender.deliver(text, { kind: "final" });
+  await sender.finish();
+}
+
 function hasVisibleAssistantPayload(message) {
   if (!message || typeof message !== "object") return false;
   if (typeof message.text === "string" && message.text.trim()) return true;
@@ -383,17 +417,30 @@ function entryShowsRunProgress(entry, startedAt) {
   return role === "assistant" || role === "toolResult" || role === "toolresult" || role === "tool";
 }
 
+function trajectoryEntryShowsRunProgress(entry, runId, startedAt) {
+  if (!entry || typeof entry !== "object") return false;
+  if (runId && entry.runId && entry.runId !== runId) return false;
+  const ts = Date.parse(entry.ts || entry.timestamp || "");
+  if (Number.isFinite(ts) && ts + 1000 < startedAt) return false;
+  const type = typeof entry.type === "string" ? entry.type : "";
+  return type.startsWith("tool.") || type.startsWith("model.") || type === "session.ended" || type === "session.error";
+}
+
 function entryStableId(entry) {
   if (!entry || typeof entry !== "object") return "";
   if (typeof entry.id === "string" && entry.id) return entry.id;
   const role = entry.message?.role || "";
   const content = typeof entry.message?.content === "string" ? entry.message.content : JSON.stringify(entry.message?.content ?? "");
-  return `${entry.timestamp || ""}:${role}:${content.slice(0, 160)}`;
+  return entry.seq != null
+    ? `${entry.ts || entry.timestamp || ""}:${entry.type || role}:${entry.seq}`
+    : `${entry.timestamp || ""}:${role}:${content.slice(0, 160)}`;
 }
 
 async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, initialCursor, startedAt, runId) {
   let cursor = initialCursor;
   let file = sessionFile;
+  let trajectoryFile = trajectoryFileForSessionFile(file);
+  let trajectoryCursor = 0;
   const deliveredIds = deliveredAssistantIds(sessionKey);
   const progressIds = new Set();
   let sentAny = false;
@@ -433,19 +480,49 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
       logger.info(`session file switched for ${sessionKey}: ${file || "none"} -> ${mappedFile}`);
       file = mappedFile;
       cursor = 0;
+      trajectoryFile = trajectoryFileForSessionFile(file);
+      trajectoryCursor = 0;
     }
     const result = readNewEntries(file, cursor);
     cursor = result.cursor;
     await processEntries(result.entries, "incremental");
 
+    if (trajectoryFile) {
+      const trajectoryResult = readNewEntries(trajectoryFile, trajectoryCursor);
+      trajectoryCursor = trajectoryResult.cursor;
+      for (const entry of trajectoryResult.entries) {
+        const stableId = entryStableId(entry);
+        if (trajectoryEntryShowsRunProgress(entry, runId, startedAt) && !progressIds.has(stableId)) {
+          progressIds.add(stableId);
+          lastProgressAt = Date.now();
+          logger.debug(`run progress ${sessionKey} via trajectory ${entry.type || "event"}`);
+        }
+      }
+    }
+
     if (!sentAny && file && Date.now() - lastCatchupScanAt >= ASSISTANT_CATCHUP_SCAN_MS) {
       lastCatchupScanAt = Date.now();
       await processEntries(readAllEntries(file), "catchup");
+      const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
+      if (pendingFinalText) {
+        await sendAssistantText(config, target, pendingFinalText);
+        sentAny = true;
+        lastSentAt = Date.now();
+        logger.info(`forwarded pending final delivery to ${target.kind}:${target.id}`);
+      }
     }
 
     if (sentAny && Date.now() - lastSentAt >= ASSISTANT_SETTLE_MS) return true;
     if (Date.now() - lastProgressAt >= ASSISTANT_IDLE_TIMEOUT_MS) break;
     await sleep(750);
+  }
+  if (!sentAny) {
+    const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
+    if (pendingFinalText) {
+      await sendAssistantText(config, target, pendingFinalText);
+      logger.info(`forwarded pending final delivery to ${target.kind}:${target.id} before timeout abort`);
+      return true;
+    }
   }
   if (!sentAny && runId) {
     const waitedMs = Date.now() - startedAt;

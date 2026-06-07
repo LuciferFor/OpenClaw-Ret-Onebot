@@ -166,6 +166,7 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - 2026-06-07 14:00 的连续私聊里，OpenClaw reset/切换了 session 文件，sidecar 仍盯旧文件导致第一条有 OpenClaw 回复但 QQ 没收到；第二条被同会话队列压到第一条超时后才送入 OpenClaw。当前 sidecar 会动态刷新 session 文件路径，并且同会话只串行 `sessions.send`，不再把后续入站消息卡到上一轮回复等待结束之后。
 - 2026-06-07 14:15 的 zip 附件只在 OpenClaw 文本里显示路径，没有发到 QQ。当前 hook 已支持文件上传，文本中 allowlist 路径如 `/home/lucifer/.openclaw/workspace/out/*.zip` 会被识别并上传；上传失败会发文本兜底。
 - 2026-06-07 15:40 的 QQ zip 入站只变成 `[file: xxx.zip]` 占位，OpenClaw 拿不到内容。当前 hook 已支持入站文件下载落盘，成功后 OpenClaw 会看到 `/home/.../.openclaw/workspace/incoming/onebot-files/...zip`。
+- 2026-06-07 17:34 的 B 站视频下载请求仍在持续写 `*.trajectory.jsonl` 工具进度，但旧 sidecar 只盯 session JSONL，180 秒未见 assistant 后误判 idle 并 abort run，最终 QQ 没收到回复。当前 sidecar 同时监听 session trajectory 的 `tool.*` / `model.*` / `session.*` 事件，并会补发 `pendingFinalDeliveryText`。
 
 ## 新机器迁移清单
 
