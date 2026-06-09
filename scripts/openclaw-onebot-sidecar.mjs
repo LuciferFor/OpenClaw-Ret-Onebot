@@ -21,6 +21,7 @@ const ASSISTANT_IDLE_TIMEOUT_MS = Number.parseInt(
 const ASSISTANT_MAX_WAIT_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_MAX_WAIT_MS || "600000", 10);
 const ASSISTANT_SETTLE_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_SETTLE_MS || "2000", 10);
 const ASSISTANT_CATCHUP_SCAN_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_CATCHUP_SCAN_MS || "3000", 10);
+const PENDING_FINAL_WAIT_MS = Number.parseInt(process.env.ONEBOT_PENDING_FINAL_WAIT_MS || "8000", 10);
 const INBOUND_TEXT_DEBOUNCE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_TEXT_DEBOUNCE_MS || "400", 10);
 const INBOUND_MEDIA_GRACE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MEDIA_GRACE_MS || "8000", 10);
 const INBOUND_MAX_BATCH_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MAX_BATCH_MS || "12000", 10);
@@ -456,6 +457,23 @@ async function sendAssistantText(config, target, text) {
   await sender.finish();
 }
 
+async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
+  const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
+  if (!pendingFinalText) return false;
+  await sendAssistantText(config, target, pendingFinalText);
+  logger.info(`forwarded pending final delivery to ${target.kind}:${target.id}${label ? ` ${label}` : ""}`);
+  return true;
+}
+
+async function waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
+  const deadline = Date.now() + PENDING_FINAL_WAIT_MS;
+  do {
+    if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label)) return true;
+    await sleep(250);
+  } while (Date.now() < deadline);
+  return false;
+}
+
 function hasVisibleAssistantPayload(message) {
   if (!message || typeof message !== "object") return false;
   if (typeof message.text === "string" && message.text.trim()) return true;
@@ -579,12 +597,9 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     await sleep(750);
   }
   if (!sentAny) {
-    const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
-    if (pendingFinalText) {
-      await sendAssistantText(config, target, pendingFinalText);
-      logger.info(`forwarded pending final delivery to ${target.kind}:${target.id} before timeout abort`);
-      return true;
-    }
+    if (file) await processEntries(readAllEntries(file), "final-catchup");
+    if (sentAny) return true;
+    if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort")) return true;
   }
   if (!sentAny && runId) {
     const waitedMs = Date.now() - startedAt;
@@ -596,8 +611,10 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     } catch (error) {
       logger.warn(`abort timed out run failed for ${sessionKey}: ${error.message || String(error)}`);
     }
+    if (await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
   } else {
     logger.warn(`assistant timeout for ${sessionKey}`);
+    if (!sentAny && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
   }
   return sentAny;
 }
