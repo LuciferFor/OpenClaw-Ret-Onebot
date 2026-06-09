@@ -25,6 +25,9 @@ const PENDING_FINAL_WAIT_MS = Number.parseInt(process.env.ONEBOT_PENDING_FINAL_W
 const INBOUND_TEXT_DEBOUNCE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_TEXT_DEBOUNCE_MS || "400", 10);
 const INBOUND_MEDIA_GRACE_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MEDIA_GRACE_MS || "8000", 10);
 const INBOUND_MAX_BATCH_MS = Number.parseInt(process.env.ONEBOT_INBOUND_MAX_BATCH_MS || "12000", 10);
+const ORPHAN_CATCHUP_SCAN_MS = Number.parseInt(process.env.ONEBOT_ORPHAN_CATCHUP_SCAN_MS || "5000", 10);
+const ORPHAN_CATCHUP_WINDOW_MS = Number.parseInt(process.env.ONEBOT_ORPHAN_CATCHUP_WINDOW_MS || "120000", 10);
+const PROCESS_STARTED_AT = Date.now();
 
 const logger = {
   debug: (message) => console.log(`[onebot-sidecar] ${message}`),
@@ -47,6 +50,7 @@ const deduper = new MessageDeduper();
 const sessionQueues = new Map();
 const inboundBuffers = new Map();
 const deliveredAssistantIdsBySession = new Map();
+let orphanCatchupTimer = null;
 
 function readJson(file, fallback) {
   try {
@@ -288,6 +292,14 @@ function deliveredAssistantIds(sessionKey) {
   }
   if (ids.size > 1000) ids.clear();
   return ids;
+}
+
+function targetFromSessionKey(sessionKey) {
+  const match = /^agent:[^:]+:onebot:(direct|group):(.+)$/.exec(sessionKey);
+  if (!match) return null;
+  const id = Number(match[2]);
+  if (!Number.isFinite(id)) return null;
+  return { kind: match[1] === "group" ? "group" : "private", id };
 }
 
 function messageText(decision, message, preparedText) {
@@ -633,6 +645,57 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   return sentAny;
 }
 
+async function catchUpOrphanedOneBotSessions(config) {
+  const sessions = readJson(SESSIONS_PATH, {});
+  const minTimestamp = PROCESS_STARTED_AT - 5000;
+  for (const [sessionKey, meta] of Object.entries(sessions)) {
+    if (!sessionKey.includes(":onebot:")) continue;
+    if (sessionQueues.has(sessionKey)) continue;
+    const target = targetFromSessionKey(sessionKey);
+    if (!target) continue;
+    const updatedAt = Number(meta?.updatedAt ?? meta?.endedAt ?? 0);
+    if (Number.isFinite(updatedAt) && updatedAt && updatedAt + ORPHAN_CATCHUP_WINDOW_MS < PROCESS_STARTED_AT) continue;
+    const file = typeof meta?.sessionFile === "string" ? meta.sessionFile : "";
+    if (!file) continue;
+    const deliveredIds = deliveredAssistantIds(sessionKey);
+    const entries = readAllEntries(file);
+    for (const entry of entries) {
+      if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
+      const stableId = entryStableId(entry);
+      if (deliveredIds.has(stableId)) continue;
+      const ts = Date.parse(entry.timestamp || "");
+      if (!Number.isFinite(ts) || ts + 1000 < minTimestamp) continue;
+      if (!hasVisibleAssistantPayload(entry.message)) continue;
+      deliveredIds.add(stableId);
+      try {
+        await sendAssistantEntry(config, target, entry);
+        logger.info(`orphan catchup forwarded assistant message ${entry.id ?? stableId} to ${target.kind}:${target.id}`);
+      } catch (error) {
+        deliveredIds.delete(stableId);
+        logger.error(`orphan catchup failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+      }
+    }
+    const pendingCreatedAt = Number(meta?.pendingFinalDeliveryCreatedAt ?? 0);
+    if (Number.isFinite(pendingCreatedAt) && pendingCreatedAt + 1000 >= minTimestamp) {
+      await forwardPendingFinalDelivery(config, target, sessionKey, minTimestamp, "via orphan catchup").catch((error) => {
+        logger.error(`orphan pending final failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+      });
+    }
+  }
+}
+
+function startOrphanCatchup(config) {
+  if (orphanCatchupTimer) clearInterval(orphanCatchupTimer);
+  orphanCatchupTimer = setInterval(() => {
+    void catchUpOrphanedOneBotSessions(config).catch((error) => {
+      logger.error(`orphan catchup scan failed: ${error.stack || error.message || String(error)}`);
+    });
+  }, ORPHAN_CATCHUP_SCAN_MS);
+  void catchUpOrphanedOneBotSessions(config).catch((error) => {
+    logger.error(`orphan catchup startup failed: ${error.stack || error.message || String(error)}`);
+  });
+}
+
 async function handleOneBotMessage(message) {
   if (deduper.isDuplicate(message)) return;
   const config = loadHookConfig();
@@ -665,6 +728,7 @@ async function connectOneBot() {
   try {
     await client.start();
     logger.info(`sidecar connected account=${config.accountId}`);
+    startOrphanCatchup(config);
   } catch (error) {
     logger.warn(`connect failed: ${error.message || String(error)}`);
     await client.stop().catch(() => undefined);
@@ -689,6 +753,7 @@ function sleep(ms) {
 process.on("SIGTERM", () => {
   stopping = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (orphanCatchupTimer) clearInterval(orphanCatchupTimer);
   for (const buffer of inboundBuffers.values()) {
     if (buffer.timer) clearTimeout(buffer.timer);
   }
@@ -698,6 +763,7 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   stopping = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (orphanCatchupTimer) clearInterval(orphanCatchupTimer);
   for (const buffer of inboundBuffers.values()) {
     if (buffer.timer) clearTimeout(buffer.timer);
   }

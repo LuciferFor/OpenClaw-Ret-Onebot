@@ -87,6 +87,7 @@ docker exec openclaw-openclaw-gateway-1 sh -lc 'node -v && ls -la /home/node/.op
 - Docker 容器内上传宿主机工作区文件时，`channels.onebot.files.pathMappings` 默认把 `/home/lucifer/.openclaw/workspace` 映射到 `/home/node/.openclaw/workspace`。
 - Docker 容器内接收 QQ 文件时，入站文件落在 `/home/node/.openclaw/workspace/incoming/onebot-files`。如果 NapCat 只返回宿主机本地路径且容器不可见，日志会记录 `inbound file download failed`，需要优先让 OneBot 返回 URL。
 - 2026-06-09 13:41 的私聊已成功 `sessions.send`，但 OpenClaw 只读了两个图片 skill 文档，最终 `model.completed` 的 `assistantTexts` 为空；sidecar 180 秒无进展后 abort，OpenClaw 随后才写 `pendingFinalDeliveryText`，旧 sidecar 没补发，导致 QQ 静默。当前 sidecar abort 后会继续等待 `ONEBOT_PENDING_FINAL_WAIT_MS=8000` 并转发 pending final。
+- 2026-06-09 13:52 的私聊在 sidecar 部署重启期间仍由 OpenClaw 继续运行，13:57 写出了 assistant 文本和图片路径，但新 sidecar 没有旧等待任务，导致完成消息未转发。当前 sidecar 启动后会按 `ONEBOT_ORPHAN_CATCHUP_SCAN_MS=5000` 扫描本进程启动后写入的 OneBot assistant，补发重启期间完成的回复。
 - sidecar 与 in-process 插件 service 同时运行时会重复回复。当前版本默认关闭 in-process service，只保留 sidecar。
 - 如果 QQ 收不到但 OpenClaw 有回复，优先查 sidecar journal 的 `forwarded assistant message`、`sent private/group`、`assistant timeout`。
 
