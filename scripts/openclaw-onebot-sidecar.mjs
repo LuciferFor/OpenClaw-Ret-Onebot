@@ -15,7 +15,7 @@ const GATEWAY_WS = process.env.OPENCLAW_GATEWAY_WS || "ws://127.0.0.1:18789/";
 const TRUSTED_USER = process.env.OPENCLAW_TRUSTED_USER || "lan@openclaw.local";
 const AGENT_ID = process.env.ONEBOT_AGENT_ID || "main";
 const ASSISTANT_IDLE_TIMEOUT_MS = Number.parseInt(
-  process.env.ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS || process.env.ONEBOT_ASSISTANT_TIMEOUT_MS || "180000",
+  process.env.ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS || process.env.ONEBOT_ASSISTANT_TIMEOUT_MS || "600000",
   10,
 );
 const ASSISTANT_MAX_WAIT_MS = Number.parseInt(process.env.ONEBOT_ASSISTANT_MAX_WAIT_MS || "600000", 10);

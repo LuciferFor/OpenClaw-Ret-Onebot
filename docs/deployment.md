@@ -10,7 +10,7 @@
 - 不依赖 agent、skills、tool 自己调用 OneBot 发消息接口。
 - OpenClaw gateway token 优先从 `OPENCLAW_GATEWAY_TOKEN` 读取；没有则从 `OPENCLAW_CONFIG_PATH` 指向的 `openclaw.json` 读取 `gateway.auth.token`。
 - sidecar 已兼容 OpenClaw `connect.challenge` 握手。
-- 出站等待默认 `ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=180000`、`ONEBOT_ASSISTANT_MAX_WAIT_MS=600000`、`ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000`。有工具调用/工具结果等 session 进展时会继续等；每 3 秒会 catch-up 扫描当前 session 文件，防止增量 cursor 漏读；完全无进展超时且没有 assistant 回复时才 `sessions.abort` 释放卡住的 run。
+- 出站等待默认 `ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=600000`、`ONEBOT_ASSISTANT_MAX_WAIT_MS=600000`、`ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000`。有工具调用/工具结果等 session 进展时会继续等；每 3 秒会 catch-up 扫描当前 session 文件，防止增量 cursor 漏读；完全无进展超时且没有 assistant 回复时才 `sessions.abort` 释放卡住的 run。
 - 出站文件默认开启：结构化 `file/path/fileUrl` 和 assistant 文本里的 allowlist 本地路径会走 OneBot `upload_private_file` / `upload_group_file`；默认上限 4GiB，失败时发路径、大小和原因文本。
 - 入站文件默认开启：OneBot `file` segment 会优先使用事件 URL，其次尝试 `get_private_file_url` / `get_group_file_url` / `get_file`，保存到 `~/.openclaw/workspace/incoming/onebot-files`，并把真实路径写入 OpenClaw `FilePath`、`FilePaths` 和 prompt 的 `[path: ...]` 行。
 - 插件进程内 service 默认不连接 OneBot，避免和 sidecar 双路回复；只有显式设置 `ONEBOT_HOOK_INPROCESS_SERVICE=1` 才启用。
@@ -129,9 +129,9 @@ Environment=OPENCLAW_TRUSTED_USER=lan@openclaw.local
 Environment=ONEBOT_AGENT_ID=main
 Environment=ONEBOT_WS_PACKAGE=/home/lucifer/.openclaw/plugins/openclaw-onebot-hook/node_modules/ws
 Environment=ONEBOT_SIDECAR_WS_URL=ws://127.0.0.1:3001
-Environment=ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=180000
+Environment=ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=600000
 Environment=ONEBOT_ASSISTANT_MAX_WAIT_MS=600000
-Environment=ONEBOT_ASSISTANT_TIMEOUT_MS=180000
+Environment=ONEBOT_ASSISTANT_TIMEOUT_MS=600000
 Environment=ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000
 Environment=ONEBOT_ASSISTANT_SETTLE_MS=2000
 ExecStart=/home/lucifer/.openclaw/tools/node-v22.22.0/bin/node /home/lucifer/.openclaw/workspace/tools/onebot/openclaw-onebot-sidecar.mjs
