@@ -215,13 +215,16 @@ function getSessionMeta(sessionKey) {
   return meta && typeof meta === "object" ? meta : null;
 }
 
-function getPendingFinalDeliveryText(sessionKey, startedAt) {
+function getPendingFinalDelivery(sessionKey, startedAt) {
   const meta = getSessionMeta(sessionKey);
   const text = meta?.pendingFinalDeliveryText;
-  if (typeof text !== "string" || !text.trim()) return "";
+  if (typeof text !== "string" || !text.trim()) return null;
   const createdAt = Number(meta?.pendingFinalDeliveryCreatedAt ?? meta?.updatedAt ?? 0);
-  if (Number.isFinite(createdAt) && createdAt && createdAt + 1000 < startedAt) return "";
-  return text.trim();
+  if (Number.isFinite(createdAt) && createdAt && createdAt + 1000 < startedAt) return null;
+  return {
+    text: text.trim(),
+    id: `pending-final:${createdAt || "unknown"}:${crypto.createHash("sha256").update(text.trim()).digest("hex").slice(0, 16)}`,
+  };
 }
 
 function trajectoryFileForSessionFile(file) {
@@ -470,9 +473,17 @@ async function sendAssistantText(config, target, text) {
 }
 
 async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
-  const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
-  if (!pendingFinalText) return false;
-  await sendAssistantText(config, target, pendingFinalText);
+  const pendingFinal = getPendingFinalDelivery(sessionKey, startedAt);
+  if (!pendingFinal) return false;
+  const deliveredIds = deliveredAssistantIds(sessionKey);
+  if (deliveredIds.has(pendingFinal.id)) return true;
+  deliveredIds.add(pendingFinal.id);
+  try {
+    await sendAssistantText(config, target, pendingFinal.text);
+  } catch (error) {
+    deliveredIds.delete(pendingFinal.id);
+    throw error;
+  }
   logger.info(`forwarded pending final delivery to ${target.kind}:${target.id}${label ? ` ${label}` : ""}`);
   return true;
 }
@@ -609,12 +620,9 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     if (!sentAny && file && Date.now() - lastCatchupScanAt >= ASSISTANT_CATCHUP_SCAN_MS) {
       lastCatchupScanAt = Date.now();
       await processEntries(readAllEntries(file), "catchup");
-      const pendingFinalText = getPendingFinalDeliveryText(sessionKey, startedAt);
-      if (pendingFinalText) {
-        await sendAssistantText(config, target, pendingFinalText);
+      if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "via catchup")) {
         sentAny = true;
         lastSentAt = Date.now();
-        logger.info(`forwarded pending final delivery to ${target.kind}:${target.id}`);
       }
     }
 
