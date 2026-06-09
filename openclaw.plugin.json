@@ -236,6 +236,55 @@
               }
             },
             "description": "Inbound file download cache and outbound file upload settings."
+          },
+          "progress": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "ack": {
+                "type": "boolean",
+                "default": true
+              },
+              "firstDelayMs": {
+                "type": "number",
+                "default": 30000
+              },
+              "intervalMs": {
+                "type": "number",
+                "default": 60000
+              },
+              "toolEvents": {
+                "type": "boolean",
+                "default": true
+              },
+              "modelEvents": {
+                "type": "boolean",
+                "default": true
+              },
+              "target": {
+                "type": "string",
+                "enum": ["same_conversation"],
+                "default": "same_conversation"
+              },
+              "group": {
+                "type": "string",
+                "enum": ["triggered_only"],
+                "default": "triggered_only"
+              },
+              "redact": {
+                "type": "boolean",
+                "default": true
+              },
+              "maxTextChars": {
+                "type": "number",
+                "default": 120
+              }
+            },
+            "description": "Sidecar progress receipts for triggered OneBot conversations."
           }
         }
       },

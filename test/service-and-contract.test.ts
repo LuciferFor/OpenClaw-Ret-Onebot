@@ -44,6 +44,18 @@ function config(mediaOverrides: Partial<OneBotHookConfig["media"]> = {}): OneBot
       pathMappings: [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
       fallbackOnFailure: "text",
     },
+    progress: {
+      enabled: true,
+      ack: true,
+      firstDelayMs: 30_000,
+      intervalMs: 60_000,
+      toolEvents: true,
+      modelEvents: true,
+      target: "same_conversation",
+      group: "triggered_only",
+      redact: true,
+      maxTextChars: 120,
+    },
   };
 }
 

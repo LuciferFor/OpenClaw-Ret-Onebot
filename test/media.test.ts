@@ -40,6 +40,18 @@ function config(cacheDir: string, overrides: Partial<OneBotHookConfig["media"]> 
       pathMappings: [],
       fallbackOnFailure: "text",
     },
+    progress: {
+      enabled: true,
+      ack: true,
+      firstDelayMs: 30_000,
+      intervalMs: 60_000,
+      toolEvents: true,
+      modelEvents: true,
+      target: "same_conversation",
+      group: "triggered_only",
+      redact: true,
+      maxTextChars: 120,
+    },
   };
 }
 
