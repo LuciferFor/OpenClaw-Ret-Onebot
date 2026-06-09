@@ -506,6 +506,15 @@ function trajectoryEntryShowsRunProgress(entry, runId, startedAt) {
   return type.startsWith("tool.") || type.startsWith("model.") || type === "session.ended" || type === "session.error";
 }
 
+function trajectoryEntryDetectedYield(entry, startedAt) {
+  if (!entry || typeof entry !== "object") return false;
+  const ts = Date.parse(entry.ts || entry.timestamp || "");
+  if (Number.isFinite(ts) && ts + 1000 < startedAt) return false;
+  const type = typeof entry.type === "string" ? entry.type : "";
+  if (type !== "model.completed" && type !== "session.ended") return false;
+  return Boolean(entry.data?.yieldDetected);
+}
+
 function entryStableId(entry) {
   if (!entry || typeof entry !== "object") return "";
   if (typeof entry.id === "string" && entry.id) return entry.id;
@@ -527,6 +536,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   let lastSentAt = 0;
   let lastProgressAt = startedAt;
   let lastCatchupScanAt = 0;
+  let yieldDetected = false;
   const maxDeadline = startedAt + ASSISTANT_MAX_WAIT_MS;
 
   const processEntries = async (entries, source) => {
@@ -572,6 +582,10 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
       trajectoryCursor = trajectoryResult.cursor;
       for (const entry of trajectoryResult.entries) {
         const stableId = entryStableId(entry);
+        if (!yieldDetected && trajectoryEntryDetectedYield(entry, startedAt)) {
+          yieldDetected = true;
+          logger.info(`yield detected for ${sessionKey}; waiting up to max deadline for follow-up completion`);
+        }
         if (trajectoryEntryShowsRunProgress(entry, runId, startedAt) && !progressIds.has(stableId)) {
           progressIds.add(stableId);
           lastProgressAt = Date.now();
@@ -593,7 +607,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     }
 
     if (sentAny && Date.now() - lastSentAt >= ASSISTANT_SETTLE_MS) return true;
-    if (Date.now() - lastProgressAt >= ASSISTANT_IDLE_TIMEOUT_MS) break;
+    if (!yieldDetected && Date.now() - lastProgressAt >= ASSISTANT_IDLE_TIMEOUT_MS) break;
     await sleep(750);
   }
   if (!sentAny) {
@@ -601,7 +615,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     if (sentAny) return true;
     if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort")) return true;
   }
-  if (!sentAny && runId) {
+  if (!sentAny && runId && !yieldDetected) {
     const waitedMs = Date.now() - startedAt;
     const idleMs = Date.now() - lastProgressAt;
     logger.warn(`assistant timeout for ${sessionKey}; aborting run=${runId} waited_ms=${waitedMs} idle_ms=${idleMs}`);
@@ -613,7 +627,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     }
     if (await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
   } else {
-    logger.warn(`assistant timeout for ${sessionKey}`);
+    logger.warn(`assistant timeout for ${sessionKey}${yieldDetected ? " after yielded wait" : ""}`);
     if (!sentAny && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
   }
   return sentAny;

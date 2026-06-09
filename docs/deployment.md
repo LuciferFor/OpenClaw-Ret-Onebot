@@ -169,6 +169,7 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - 2026-06-07 15:40 的 QQ zip 入站只变成 `[file: xxx.zip]` 占位，OpenClaw 拿不到内容。当前 hook 已支持入站文件下载落盘，成功后 OpenClaw 会看到 `/home/.../.openclaw/workspace/incoming/onebot-files/...zip`。
 - 2026-06-07 17:34 的 B 站视频下载请求仍在持续写 `*.trajectory.jsonl` 工具进度，但旧 sidecar 只盯 session JSONL，180 秒未见 assistant 后误判 idle 并 abort run，最终 QQ 没收到回复。当前 sidecar 同时监听 session trajectory 的 `tool.*` / `model.*` / `session.*` 事件，并会补发 `pendingFinalDeliveryText`。
 - 2026-06-07 21:49 的私聊先发图片、数秒后再发文字，旧 sidecar 把两条消息拆成两个并发 run，并且纯文本 `sessions.send` 里只带 `[image: xxx]` 占位，OpenClaw 看不到本地图片路径。当前 sidecar 会把媒体-only 入站短暂缓冲，默认等 `ONEBOT_INBOUND_MEDIA_GRACE_MS=8000`，并把下载后的图片 `[path: ...]` 写入模型可读文本。
+- 2026-06-09 13:41 的双路出图触发 `sessions_yield` 等子会话，旧 sidecar 在 180 秒 idle 后 abort，子会话完成后的最终 assistant 文本晚到约 38 秒，导致 QQ 没收到第一轮结果。当前 sidecar 识别 trajectory 的 `yieldDetected=true` 后会继续等到 `ONEBOT_ASSISTANT_MAX_WAIT_MS`，不按普通 idle 超时 abort。
 
 ## 新机器迁移清单
 
