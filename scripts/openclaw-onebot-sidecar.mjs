@@ -41,7 +41,6 @@ const { getOneBotHookConfig } = await importFromPlugin("dist/config.js");
 const { MessageDeduper, OneBotClient, isOkResponse } = await importFromPlugin("dist/onebot-client.js");
 const { decideInbound, buildSessionKey } = await importFromPlugin("dist/inbound.js");
 const { prepareInboundMediaParts, partsToText } = await importFromPlugin("dist/media.js");
-const { formatProgressAck, formatProgressFailure, formatProgressTimeout, formatProgressWait, formatTrajectoryProgress } = await importFromPlugin("dist/progress.js");
 const { ReplyChunkSender, sendOneBotFileToCapturedTarget, sendOneBotMessageToCapturedTarget } = await importFromPlugin("dist/outbound.js");
 
 let stopping = false;
@@ -423,13 +422,7 @@ async function flushInboundBuffer(sessionKey) {
     const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
     const startedAt = Date.now();
     logger.info(`dispatch ${sessionKey} target=${buffer.target.kind}:${buffer.target.id} messages=${buffer.items.length}`);
-    let result;
-    try {
-      result = await dispatchToOpenClaw(sessionKey, text);
-    } catch (error) {
-      await sendProgressMessage(buffer.config, buffer.target, formatProgressFailure(error, buffer.config.progress), "dispatch-failed");
-      throw error;
-    }
+    const result = await dispatchToOpenClaw(sessionKey, text);
     logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
     await waitAndForwardAssistant(buffer.config, buffer.target, sessionKey, beforeFile, beforeCursor, startedAt, result?.runId);
   });
@@ -477,27 +470,6 @@ async function sendAssistantText(config, target, text) {
   );
   await sender.deliver(text, { kind: "final" });
   await sender.finish();
-}
-
-async function sendProgressMessage(config, target, progress, label = "") {
-  if (!progress || !config.progress?.enabled) return false;
-  try {
-    await sendOneBotMessageToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, target, progress.text, logger);
-    logger.info(`sent progress ${target.kind}:${target.id} id=${progress.id}${label ? ` ${label}` : ""}`);
-    return true;
-  } catch (error) {
-    logger.warn(`progress send failed ${target.kind}:${target.id} id=${progress.id}: ${error.message || String(error)}`);
-    return false;
-  }
-}
-
-async function sendProgressIfNew(config, target, progress, sentIds, label = "") {
-  if (!progress) return false;
-  if (sentIds?.has(progress.id)) return false;
-  sentIds?.add(progress.id);
-  const ok = await sendProgressMessage(config, target, progress, label);
-  if (!ok) sentIds?.delete(progress.id);
-  return ok;
 }
 
 async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
@@ -557,14 +529,6 @@ function trajectoryEntryShowsRunProgress(entry, runId, startedAt) {
   return type.startsWith("tool.") || type.startsWith("model.") || type === "session.ended" || type === "session.error";
 }
 
-function trajectoryEntryMatchesRun(entry, runId, startedAt) {
-  if (!entry || typeof entry !== "object") return false;
-  if (runId && entry.runId && entry.runId !== runId) return false;
-  const ts = Date.parse(entry.ts || entry.timestamp || "");
-  if (Number.isFinite(ts) && ts + 1000 < startedAt) return false;
-  return true;
-}
-
 function trajectoryEntryDetectedYield(entry, startedAt) {
   if (!entry || typeof entry !== "object") return false;
   const ts = Date.parse(entry.ts || entry.timestamp || "");
@@ -591,12 +555,10 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   let trajectoryCursor = 0;
   const deliveredIds = deliveredAssistantIds(sessionKey);
   const progressIds = new Set();
-  const sentProgressIds = new Set();
   let sentAny = false;
   let lastSentAt = 0;
   let lastProgressAt = startedAt;
   let lastCatchupScanAt = 0;
-  let nextWaitProgressAt = config.progress?.enabled ? startedAt + config.progress.firstDelayMs : Number.POSITIVE_INFINITY;
   let yieldDetected = false;
   const maxDeadline = startedAt + ASSISTANT_MAX_WAIT_MS;
 
@@ -643,9 +605,6 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
       trajectoryCursor = trajectoryResult.cursor;
       for (const entry of trajectoryResult.entries) {
         const stableId = entryStableId(entry);
-        if (trajectoryEntryMatchesRun(entry, runId, startedAt)) {
-          await sendProgressIfNew(config, target, formatTrajectoryProgress(entry, config.progress), sentProgressIds, "via trajectory");
-        }
         if (!yieldDetected && trajectoryEntryDetectedYield(entry, startedAt)) {
           yieldDetected = true;
           logger.info(`yield detected for ${sessionKey}; waiting up to max deadline for follow-up completion`);
@@ -656,11 +615,6 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
           logger.debug(`run progress ${sessionKey} via trajectory ${entry.type || "event"}`);
         }
       }
-    }
-
-    if (!sentAny && Date.now() >= nextWaitProgressAt) {
-      await sendProgressIfNew(config, target, formatProgressWait(Date.now() - startedAt, config.progress), sentProgressIds, "wait");
-      nextWaitProgressAt = Date.now() + config.progress.intervalMs;
     }
 
     if (!sentAny && file && Date.now() - lastCatchupScanAt >= ASSISTANT_CATCHUP_SCAN_MS) {
@@ -684,7 +638,6 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   if (!sentAny && runId && !yieldDetected) {
     const waitedMs = Date.now() - startedAt;
     const idleMs = Date.now() - lastProgressAt;
-    await sendProgressIfNew(config, target, formatProgressTimeout(runId, waitedMs, config.progress), sentProgressIds, "timeout");
     logger.warn(`assistant timeout for ${sessionKey}; aborting run=${runId} waited_ms=${waitedMs} idle_ms=${idleMs}`);
     try {
       await abortOpenClawRun(sessionKey, runId);
@@ -694,7 +647,6 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     }
     if (await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
   } else {
-    await sendProgressIfNew(config, target, formatProgressTimeout(runId, Date.now() - startedAt, config.progress), sentProgressIds, "timeout");
     logger.warn(`assistant timeout for ${sessionKey}${yieldDetected ? " after yielded wait" : ""}`);
     if (!sentAny && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
   }
@@ -763,9 +715,6 @@ async function handleOneBotMessage(message) {
 
   const target = decision.target;
   const sessionKey = buildSessionKey(AGENT_ID, target);
-  void sendProgressMessage(config, target, formatProgressAck(config.progress), "ack").catch((error) => {
-    logger.warn(`progress ack failed ${target.kind}:${target.id}: ${error.message || String(error)}`);
-  });
   const preparedText = await prepareInboundPromptText(config, decision, message, target);
   queueInboundForDispatch(config, sessionKey, target, { decision, message, preparedText });
 }

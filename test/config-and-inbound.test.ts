@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { getOneBotHookConfig } from "../src/config.js";
 import { decideInbound, buildSessionKey, extractMessageText, isMentioned } from "../src/inbound.js";
 import { extractInboundParts, partsToText } from "../src/media.js";
 import type { OneBotHookConfig, OneBotMessageEvent } from "../src/types.js";
@@ -46,40 +45,9 @@ function config(overrides: Partial<OneBotHookConfig> = {}): OneBotHookConfig {
       pathMappings: [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
       fallbackOnFailure: "text",
     },
-    progress: {
-      enabled: true,
-      ack: true,
-      firstDelayMs: 30_000,
-      intervalMs: 60_000,
-      toolEvents: true,
-      modelEvents: true,
-      target: "same_conversation",
-      group: "triggered_only",
-      redact: true,
-      maxTextChars: 120,
-    },
     ...overrides,
   };
 }
-
-describe("config", () => {
-  it("normalizes default progress receipts", () => {
-    const normalized = getOneBotHookConfig({ channels: { onebot: { ws: { url: "ws://127.0.0.1:3001" } } } });
-
-    expect(normalized?.progress).toEqual({
-      enabled: true,
-      ack: true,
-      firstDelayMs: 30_000,
-      intervalMs: 60_000,
-      toolEvents: true,
-      modelEvents: true,
-      target: "same_conversation",
-      group: "triggered_only",
-      redact: true,
-      maxTextChars: 120,
-    });
-  });
-});
 
 describe("inbound decisions", () => {
   it("forwards all private text messages by default", () => {

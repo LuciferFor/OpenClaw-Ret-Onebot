@@ -48,18 +48,6 @@ function config(overrides: Partial<OneBotHookConfig["reply"]> = {}, fileOverride
       fallbackOnFailure: "text",
       ...fileOverrides,
     },
-    progress: {
-      enabled: true,
-      ack: true,
-      firstDelayMs: 30_000,
-      intervalMs: 60_000,
-      toolEvents: true,
-      modelEvents: true,
-      target: "same_conversation",
-      group: "triggered_only",
-      redact: true,
-      maxTextChars: 120,
-    },
   };
 }
 

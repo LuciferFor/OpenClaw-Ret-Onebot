@@ -80,18 +80,6 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
           }
         ],
         "fallbackOnFailure": "text"
-      },
-      "progress": {
-        "enabled": true,
-        "ack": true,
-        "firstDelayMs": 30000,
-        "intervalMs": 60000,
-        "toolEvents": true,
-        "modelEvents": true,
-        "target": "same_conversation",
-        "group": "triggered_only",
-        "redact": true,
-        "maxTextChars": 120
       }
     }
   }
@@ -100,7 +88,6 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
 
 Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present. Image + text messages preserve their OneBot segment order; inbound images are cached locally when possible and outbound images are sent as OneBot `image` segments. File attachments are uploaded with OneBot/NapCat `upload_private_file` or `upload_group_file`; assistant text paths are only auto-uploaded when they point at a real file under `channels.onebot.files.allowedRoots`.
 Inbound OneBot `file` segments are downloaded into `channels.onebot.files.incomingDir` when OneBot exposes a URL, local path, base64 source, or a resolvable `get_file` result. The saved path is added to OpenClaw as `FilePath` / `FilePaths` and as a readable `[path: ...]` line in the prompt.
-Progress receipts are sent by the sidecar itself, not by agent tools. They acknowledge triggered inbound messages, summarize model/tool runtime events from OpenClaw trajectory files, and send periodic waiting updates without exposing hidden reasoning or tool arguments.
 
 ## Verify
 

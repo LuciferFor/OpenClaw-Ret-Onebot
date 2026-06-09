@@ -1,13 +1,4 @@
-import type {
-  OneBotFileConfig,
-  OneBotFilePathMapping,
-  OneBotHookConfig,
-  OneBotMediaConfig,
-  OneBotProgressConfig,
-  OneBotReplyConfig,
-  OneBotTriggerConfig,
-  OneBotWsConfig,
-} from "./types.js";
+import type { OneBotFileConfig, OneBotFilePathMapping, OneBotHookConfig, OneBotMediaConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
 
 const DEFAULT_WS_PATH = "/onebot/v11/ws";
 
@@ -100,21 +91,6 @@ function normalizeFileConfig(raw: any): OneBotFileConfig {
   };
 }
 
-function normalizeProgressConfig(raw: any): OneBotProgressConfig {
-  return {
-    enabled: raw?.enabled === undefined ? true : Boolean(raw.enabled),
-    ack: raw?.ack === undefined ? true : Boolean(raw.ack),
-    firstDelayMs: asNumber(raw?.firstDelayMs, 30_000, 1_000, 10 * 60_000),
-    intervalMs: asNumber(raw?.intervalMs, 60_000, 5_000, 10 * 60_000),
-    toolEvents: raw?.toolEvents === undefined ? true : Boolean(raw.toolEvents),
-    modelEvents: raw?.modelEvents === undefined ? true : Boolean(raw.modelEvents),
-    target: "same_conversation",
-    group: "triggered_only",
-    redact: raw?.redact === undefined ? true : Boolean(raw.redact),
-    maxTextChars: asNumber(raw?.maxTextChars, 120, 20, 1000),
-  };
-}
-
 export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): OneBotHookConfig | null {
   const root = apiOrConfig?.config ?? apiOrConfig ?? {};
   const channel = root?.channels?.onebot;
@@ -135,7 +111,6 @@ export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): On
     reply: normalizeReplyConfig(raw.reply),
     media: normalizeMediaConfig(raw.media),
     files: normalizeFileConfig(raw.files),
-    progress: normalizeProgressConfig(raw.progress),
   };
 }
 

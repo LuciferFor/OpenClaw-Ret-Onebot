@@ -52,19 +52,6 @@ export interface OneBotFileConfig {
   fallbackOnFailure: "text";
 }
 
-export interface OneBotProgressConfig {
-  enabled: boolean;
-  ack: boolean;
-  firstDelayMs: number;
-  intervalMs: number;
-  toolEvents: boolean;
-  modelEvents: boolean;
-  target: "same_conversation";
-  group: "triggered_only";
-  redact: boolean;
-  maxTextChars: number;
-}
-
 export interface OneBotHookConfig {
   enabled: boolean;
   accountId: string;
@@ -77,7 +64,6 @@ export interface OneBotHookConfig {
   reply: OneBotReplyConfig;
   media: OneBotMediaConfig;
   files: OneBotFileConfig;
-  progress: OneBotProgressConfig;
 }
 
 export interface OneBotSenderInfo {
