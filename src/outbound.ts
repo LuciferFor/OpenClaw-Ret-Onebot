@@ -1,7 +1,7 @@
 import { basename, isAbsolute, normalize, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import type { CapturedReplyTarget, LoggerLike, OneBotFileUploadData, OneBotHookConfig, OneBotMessageSegment, OneBotOutgoingMessage, OneBotSendData } from "./types.js";
 import { collapseDoubleNewlines, markdownToPlain } from "./markdown.js";
 import { isOkResponse, OneBotClient } from "./onebot-client.js";
@@ -30,6 +30,10 @@ type ReplyPart =
   | { kind: "text"; text: string; rawText: string }
   | { kind: "image"; url: string; alt?: string }
   | ReplyFilePart;
+
+const MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
+const QQMEDIA_PATTERN = /<qqmedia>\s*([\s\S]*?)\s*<\/qqmedia>/gi;
+const DEFAULT_OUTBOUND_IMAGE_MAX_BYTES = 15_000_000;
 
 export interface ReplyFilePart {
   kind: "file";
@@ -233,9 +237,9 @@ export class ReplyChunkSender {
     if (!opts.mediaOnly && parts.length === 0) {
       parts.push(...this.extractTextAndMarkdownImages(stringValue(payload.text) ?? stringValue(payload.body) ?? ""));
     }
-    for (const url of normalizeUrlList(payload.mediaUrl)) parts.push({ kind: "image", url });
-    for (const url of normalizeUrlList(payload.mediaUrls)) parts.push({ kind: "image", url });
-    const directImage = imageUrlFromContentItem(payload as Record<string, unknown>);
+    for (const url of normalizeUrlList(payload.mediaUrl, this.config)) parts.push({ kind: "image", url });
+    for (const url of normalizeUrlList(payload.mediaUrls, this.config)) parts.push({ kind: "image", url });
+    const directImage = imageUrlFromContentItem(payload as Record<string, unknown>, this.config);
     if (directImage) parts.push({ kind: "image", url: directImage });
     const directFile = filePartFromContentItem(payload as Record<string, unknown>, this.config, false);
     if (directFile) parts.push(directFile);
@@ -261,7 +265,7 @@ export class ReplyChunkSender {
         }
         continue;
       }
-      const imageUrl = imageUrlFromContentItem(value);
+      const imageUrl = imageUrlFromContentItem(value, this.config);
       if (imageUrl && isImageContentType(type)) {
         parts.push({ kind: "image", url: imageUrl, alt: stringValue(value.alt) });
       }
@@ -281,28 +285,32 @@ export class ReplyChunkSender {
 
   private extractTextAndMarkdownImages(input: string): ReplyPart[] {
     if (!input.trim()) return [];
-    if (!this.config.media.enabled || !this.config.media.markdownImages) {
-      const text = this.prepareText(input);
+    if (!this.config.media.enabled) {
+      const text = this.prepareText(stripQqMediaTags(input));
       return text ? [{ kind: "text", text, rawText: input }] : [];
     }
 
     const parts: ReplyPart[] = [];
-    const pattern = /!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
+    const pattern = mediaPattern(this.config.media.markdownImages);
     let lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(input)) !== null) {
       const before = input.slice(lastIndex, match.index);
       const text = this.prepareText(before);
       if (text) parts.push({ kind: "text", text, rawText: before });
-      const url = normalizeOutboundImageSource(match[2].replace(/^<|>$/g, ""));
-      if (url) parts.push({ kind: "image", url, alt: match[1] || undefined });
+      if (match[1] === "<qqmedia>") {
+        parts.push(...qqMediaPartsFromSource(match[2], this.config));
+      } else {
+        const url = normalizeOutboundImageSource(match[4].replace(/^<|>$/g, ""), this.config);
+        if (url) parts.push({ kind: "image", url, alt: match[3] || undefined });
+      }
       lastIndex = match.index + match[0].length;
     }
     const rest = input.slice(lastIndex);
     const text = this.prepareText(rest);
     if (text) parts.push({ kind: "text", text, rawText: rest });
     if (this.config.files.enabled && this.config.files.detectTextPaths) {
-      parts.push(...filePartsFromText(input, this.config));
+      parts.push(...filePartsFromText(stripExplicitMediaSyntax(input), this.config));
     }
     return parts;
   }
@@ -424,16 +432,16 @@ function isNoReply(parts: ReplyPart[]): boolean {
   return !raw || raw === "NO_REPLY" || raw.endsWith("NO_REPLY");
 }
 
-function normalizeUrlList(value: unknown): string[] {
+function normalizeUrlList(value: unknown, config?: OneBotHookConfig): string[] {
   if (Array.isArray(value)) return value.map((item) => {
-    if (item && typeof item === "object") return imageUrlFromContentItem(item as Record<string, unknown>);
-    return normalizeOutboundImageSource(stringValue(item));
+    if (item && typeof item === "object") return imageUrlFromContentItem(item as Record<string, unknown>, config);
+    return normalizeOutboundImageSource(stringValue(item), config);
   }).filter((item): item is string => Boolean(item));
-  const single = normalizeOutboundImageSource(stringValue(value));
+  const single = normalizeOutboundImageSource(stringValue(value), config);
   return single ? [single] : [];
 }
 
-function imageUrlFromContentItem(value: Record<string, unknown>): string | undefined {
+function imageUrlFromContentItem(value: Record<string, unknown>, config?: OneBotHookConfig): string | undefined {
   const type = stringValue(value.type);
   if (isFileContentType(type)) return undefined;
   const direct =
@@ -441,16 +449,16 @@ function imageUrlFromContentItem(value: Record<string, unknown>): string | undef
     stringValue(value.imageUrl) ??
     stringValue(value.mediaUrl) ??
     stringValue(value.dataUri);
-  if (direct) return normalizeOutboundImageSource(direct);
+  if (direct) return normalizeOutboundImageSource(direct, config);
   if (isImageContentType(type) && type) {
     const imageFileSource = stringValue(value.file) ?? stringValue(value.path) ?? stringValue(value.source);
-    if (imageFileSource) return normalizeOutboundImageSource(imageFileSource);
+    if (imageFileSource) return normalizeOutboundImageSource(imageFileSource, config);
   }
   const camelImageUrl = value.imageUrl;
-  if (camelImageUrl && typeof camelImageUrl === "object") return normalizeOutboundImageSource(stringValue((camelImageUrl as Record<string, unknown>).url));
+  if (camelImageUrl && typeof camelImageUrl === "object") return normalizeOutboundImageSource(stringValue((camelImageUrl as Record<string, unknown>).url), config);
   const imageUrl = value.image_url;
-  if (typeof imageUrl === "string") return normalizeOutboundImageSource(imageUrl);
-  if (imageUrl && typeof imageUrl === "object") return normalizeOutboundImageSource(stringValue((imageUrl as Record<string, unknown>).url));
+  if (typeof imageUrl === "string") return normalizeOutboundImageSource(imageUrl, config);
+  if (imageUrl && typeof imageUrl === "object") return normalizeOutboundImageSource(stringValue((imageUrl as Record<string, unknown>).url), config);
   return undefined;
 }
 
@@ -485,6 +493,37 @@ function filePartsFromText(input: string, config: OneBotHookConfig): ReplyFilePa
     parts.push(part);
   }
   return parts;
+}
+
+function qqMediaPartsFromSource(source: string, config: OneBotHookConfig): ReplyPart[] {
+  const value = source.trim();
+  if (!value) return [];
+  if (isLikelyImageSource(value)) {
+    const url = normalizeOutboundImageSource(value, config);
+    return url ? [{ kind: "image", url }] : [];
+  }
+  const file = filePartFromSource(value, undefined, config, false);
+  return file ? [file] : [];
+}
+
+function mediaPattern(markdownImages: boolean): RegExp {
+  const markdown = markdownImages ? String.raw`!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)` : String.raw`(?!)`;
+  return new RegExp(`${String.raw`(<qqmedia>)\s*([\s\S]*?)\s*<\/qqmedia>`}|${markdown}`, "gi");
+}
+
+function stripExplicitMediaSyntax(input: string): string {
+  return stripQqMediaTags(input).replace(MARKDOWN_IMAGE_PATTERN, " ");
+}
+
+function stripQqMediaTags(input: string): string {
+  return input.replace(QQMEDIA_PATTERN, " ");
+}
+
+function isLikelyImageSource(source: string): boolean {
+  if (/^data:image\//i.test(source)) return true;
+  if (/^base64:\/\//i.test(source)) return true;
+  const withoutQuery = source.split(/[?#]/u, 1)[0] ?? source;
+  return /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i.test(withoutQuery.trim());
 }
 
 function filePartFromSource(source: string, name: string | undefined, config: OneBotHookConfig, fromText: boolean): ReplyFilePart | undefined {
@@ -623,13 +662,42 @@ function formatBytes(value: number): string {
   return `${Number(size.toFixed(2))}PB`;
 }
 
-export function normalizeOutboundImageSource(value: string | undefined): string | undefined {
+export function normalizeOutboundImageSource(value: string | undefined, config?: Pick<OneBotHookConfig, "media">): string | undefined {
   if (!value) return undefined;
   const dataUri = /^data:image\/[a-z0-9.+-]+;base64,([\s\S]+)$/i.exec(value);
   if (dataUri) return `base64://${dataUri[1].replace(/\s+/g, "")}`;
-  if (/^(https?:\/\/|file:\/\/|base64:\/\/)/i.test(value)) return value;
-  if (isAbsolute(value)) return pathToFileURL(value).href;
+  if (/^base64:\/\//i.test(value)) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^file:\/\//i.test(value)) {
+    const local = localImageFileToBase64(fileUriToPath(value), config);
+    return local ?? value;
+  }
+  if (isAbsolute(value)) {
+    const local = localImageFileToBase64(value, config);
+    return local ?? pathToFileURL(value).href;
+  }
   return value;
+}
+
+function fileUriToPath(value: string): string | undefined {
+  try {
+    return fileURLToPath(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function localImageFileToBase64(file: string | undefined, config?: Pick<OneBotHookConfig, "media">): string | undefined {
+  if (!file || !isLikelyImageSource(file)) return undefined;
+  try {
+    const info = statSync(file);
+    if (!info.isFile()) return undefined;
+    const maxBytes = config?.media?.maxImageBytes ?? DEFAULT_OUTBOUND_IMAGE_MAX_BYTES;
+    if (info.size > maxBytes) return undefined;
+    return `base64://${readFileSync(file).toString("base64")}`;
+  } catch {
+    return undefined;
+  }
 }
 
 function isImageContentType(type: string | undefined): boolean {

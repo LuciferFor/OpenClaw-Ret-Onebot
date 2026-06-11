@@ -139,6 +139,55 @@ describe("ReplyChunkSender", () => {
     ]);
   });
 
+  it("sends qqmedia image tags as ordered OneBot segments", async () => {
+    const file = await makeTempFile("generated.png", "png");
+    const sends: OneBotOutgoingMessage[] = [];
+    const uploads: string[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      },
+      {},
+      {
+        sendFile: async (_target, part) => {
+          uploads.push(part.file);
+          return "f1";
+        },
+      }
+    );
+
+    await sender.deliver(`出了：\n\n<qqmedia>${file}</qqmedia>`, { kind: "final" });
+
+    expect(uploads).toEqual([]);
+    expect(sends).toEqual([
+      [
+        { type: "text", data: { text: "出了：" } },
+        { type: "image", data: { file: "base64://cG5n" } },
+      ],
+    ]);
+  });
+
+  it("does not leak qqmedia tags as literal text", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliver("<qqmedia>https://example.test/a.png</qqmedia>", { kind: "final" });
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "https://example.test/a.png" } }],
+    ]);
+  });
+
   it("sends mediaUrl payloads as mixed text and image segments", async () => {
     const sends: OneBotOutgoingMessage[] = [];
     const sender = new ReplyChunkSender(

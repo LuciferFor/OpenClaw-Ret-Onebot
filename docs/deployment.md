@@ -12,6 +12,7 @@
 - sidecar 已兼容 OpenClaw `connect.challenge` 握手。
 - 出站等待默认 `ONEBOT_ASSISTANT_IDLE_TIMEOUT_MS=600000`、`ONEBOT_ASSISTANT_MAX_WAIT_MS=600000`、`ONEBOT_ASSISTANT_CATCHUP_SCAN_MS=3000`。有工具调用/工具结果等 session 进展时会继续等；每 3 秒会 catch-up 扫描当前 session 文件，防止增量 cursor 漏读；完全无进展超时且没有 assistant 回复时才 `sessions.abort` 释放卡住的 run。
 - 出站文件默认开启：结构化 `file/path/fileUrl` 和 assistant 文本里的 allowlist 本地路径会走 OneBot `upload_private_file` / `upload_group_file`；默认上限 4GiB，失败时发路径、大小和原因文本。
+- 出站图片支持 OpenClaw/agent 文本里的 `<qqmedia>本地图片路径或URL</qqmedia>` 占位；hook 会剥掉标签并转 OneBot `image` segment。本地图片会先读成 `base64://...` 再发，避免 NapCat 对 `file://` 或容器/宿主路径权限不稳定导致 `rich media transfer failed`。
 - 入站文件默认开启：OneBot `file` segment 会优先使用事件 URL，其次尝试 `get_private_file_url` / `get_group_file_url` / `get_file`，保存到 `~/.openclaw/workspace/incoming/onebot-files`，并把真实路径写入 OpenClaw `FilePath`、`FilePaths` 和 prompt 的 `[path: ...]` 行。
 - 插件进程内 service 默认不连接 OneBot，避免和 sidecar 双路回复；只有显式设置 `ONEBOT_HOOK_INPROCESS_SERVICE=1` 才启用。
 
@@ -91,6 +92,7 @@ docker exec openclaw-openclaw-gateway-1 sh -lc 'node -v && ls -la /home/node/.op
 - 2026-06-09 14:42 的 pending final 被 orphan catchup 每 5 秒重复转发，表现为 QQ 连续收到 `Agent couldn't generate a response...`。原因是 pending final 没有稳定 delivered id；当前 sidecar 已用 `pending-final:<createdAt>:<sha256>` 纳入 `sentAssistantIds` 去重。
 - sidecar 与 in-process 插件 service 同时运行时会重复回复。当前版本默认关闭 in-process service，只保留 sidecar。
 - 如果 QQ 收不到但 OpenClaw 有回复，优先查 sidecar journal 的 `forwarded assistant message`、`sent private/group`、`assistant timeout`。
+- 2026-06-11 04:46 的群聊 `d2stats --catalyst 挽歌` 已进入 D2 直连网关，日志为 `d2-direct-start ... card=catalyst_status`，但 120 秒后返回 `This operation was aborted`。原因不是 OneBot/OpenClaw hook 丢消息，而是 D2 catalyst 卡片请求/渲染超过了 D2 组件 120 秒超时。31.11 已把容器内 D2 直连超时热修为 10 分钟：`/home/node/.openclaw/workspace/tools/onebot/openclaw-onebot-sidecar.mjs`、`bridge-onebot-openclaw.js`、`/home/node/.openclaw/plugins/d2stats/lib/core.mjs` 和 `plugins/d2stats/onebot/bridge-onebot-openclaw.cjs`。以后升级 d2stats 或重新部署该外部组件时，要保留 `timeoutMs=600000` 以及 core 的 `raw.timeoutMs` clamp 上限 600000。
 
 ## 192.168.31.9
 
@@ -172,6 +174,7 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - 2026-06-07 17:34 的 B 站视频下载请求仍在持续写 `*.trajectory.jsonl` 工具进度，但旧 sidecar 只盯 session JSONL，180 秒未见 assistant 后误判 idle 并 abort run，最终 QQ 没收到回复。当前 sidecar 同时监听 session trajectory 的 `tool.*` / `model.*` / `session.*` 事件，并会补发 `pendingFinalDeliveryText`。
 - 2026-06-07 21:49 的私聊先发图片、数秒后再发文字，旧 sidecar 把两条消息拆成两个并发 run，并且纯文本 `sessions.send` 里只带 `[image: xxx]` 占位，OpenClaw 看不到本地图片路径。当前 sidecar 会把媒体-only 入站短暂缓冲，默认等 `ONEBOT_INBOUND_MEDIA_GRACE_MS=8000`，并把下载后的图片 `[path: ...]` 写入模型可读文本。
 - 2026-06-09 13:41 的双路出图触发 `sessions_yield` 等子会话，旧 sidecar 在 180 秒 idle 后 abort，子会话完成后的最终 assistant 文本晚到约 38 秒，导致 QQ 没收到第一轮结果。当前 sidecar 识别 trajectory 的 `yieldDetected=true` 后会继续等到 `ONEBOT_ASSISTANT_MAX_WAIT_MS`，不按普通 idle 超时 abort。
+- 2026-06-11 19:46 的群聊出图只发出 `<qqmedia>/home/lucifer/.openclaw/media/qqbot/generated/*.png</qqmedia>` 文本。原因是出站解析漏掉 `qqmedia` 标签；第一次修复成 `file://` 后 31.9 NapCat 返回 `rich media transfer failed`。当前版本会把本地图片转为 `base64://` OneBot 图片段；已用 `/home/lucifer/.openclaw/media/qqbot/generated/ayane-cos-style-20260611.png` 私聊实测成功，日志为 `sent private ... segments=text,image`。
 
 ## 新机器迁移清单
 
