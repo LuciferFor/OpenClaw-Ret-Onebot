@@ -110,6 +110,26 @@ describe("inbound decisions", () => {
     expect(decision.parts).toEqual([{ kind: "text", text: "对方在群里直接 @ 了你，没有附加文字。请简短回应对方。" }]);
   });
 
+  it("keeps reply context for group mention plus quoted media", () => {
+    const decision = decideInbound(config(), {
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "reply", data: { id: 123 } },
+        { type: "at", data: { qq: 42 } },
+      ],
+      raw_message: "[CQ:reply,id=123][CQ:at,qq=42]",
+    });
+
+    expect(decision.forward).toBe(true);
+    expect(decision.reason).toBe("group-mentioned");
+    expect(decision.text).toBe("");
+    expect(decision.promptText).toContain("[reply #123]");
+  });
+
   it("forwards pure image private messages", () => {
     const decision = decideInbound(config(), {
       post_type: "message",
@@ -171,6 +191,23 @@ describe("inbound decisions", () => {
     });
 
     expect(partsToText(parts, { includeMedia: true })).toBe("before\n[image: middle.png]\nafter");
+  });
+
+  it("keeps quoted messages out of trigger text while preserving them for the prompt", () => {
+    const parts = extractInboundParts({
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "reply", data: { id: 123 } },
+        { type: "text", data: { text: " 我的引用看得到么" } },
+      ],
+    });
+
+    expect(partsToText(parts, { includeMedia: false })).toBe("我的引用看得到么");
+    expect(partsToText(parts, { includeMedia: true })).toContain("[reply #123]");
   });
 
   it("applies allow and deny peer filters to users and groups", () => {

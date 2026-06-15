@@ -10,10 +10,12 @@ import type {
   InboundMediaKind,
   InboundMediaPart,
   InboundMessagePart,
+  InboundReplyPart,
   LoggerLike,
   OneBotFileData,
   OneBotHookConfig,
   OneBotImageData,
+  OneBotMessageData,
   OneBotMessageEvent,
   OneBotMessageSegment,
 } from "./types.js";
@@ -25,6 +27,7 @@ export interface ExtractInboundPartOptions {
 
 export type ResolveOneBotImageSource = (file: string, part: InboundMediaPart) => Promise<OneBotImageData | undefined>;
 export type ResolveOneBotFileSource = (part: InboundMediaPart) => Promise<OneBotFileData | undefined>;
+export type ResolveOneBotReplySource = (part: InboundReplyPart) => Promise<OneBotMessageData | undefined>;
 
 let lastCleanupAt = 0;
 
@@ -43,7 +46,20 @@ export async function prepareInboundMediaParts(
   config: OneBotHookConfig,
   logger: LoggerLike = {},
   resolveImage?: ResolveOneBotImageSource,
-  resolveFile?: ResolveOneBotFileSource
+  resolveFile?: ResolveOneBotFileSource,
+  resolveReply?: ResolveOneBotReplySource
+): Promise<InboundMessagePart[]> {
+  return prepareInboundMediaPartsInternal(parts, config, logger, resolveImage, resolveFile, resolveReply, 0);
+}
+
+async function prepareInboundMediaPartsInternal(
+  parts: InboundMessagePart[],
+  config: OneBotHookConfig,
+  logger: LoggerLike = {},
+  resolveImage?: ResolveOneBotImageSource,
+  resolveFile?: ResolveOneBotFileSource,
+  resolveReply?: ResolveOneBotReplySource,
+  replyDepth = 0
 ): Promise<InboundMessagePart[]> {
   if (!config.media.enabled) return parts.map((part) => markMediaSkipped(part, "media-disabled"));
   await cleanupExpiredMedia(config, logger).catch((error) => {
@@ -60,13 +76,17 @@ export async function prepareInboundMediaParts(
       prepared.push(await downloadFilePart(part, config, logger, resolveFile));
       continue;
     }
+    if (part.kind === "reply") {
+      prepared.push(await resolveReplyPart(part, config, logger, resolveImage, resolveFile, resolveReply, replyDepth));
+      continue;
+    }
     prepared.push(part);
   }
   return prepared;
 }
 
 export function partsHaveMedia(parts: InboundMessagePart[]): boolean {
-  return parts.some((part) => part.kind === "image" || part.kind === "record" || part.kind === "video" || part.kind === "file");
+  return parts.some((part) => part.kind === "image" || part.kind === "record" || part.kind === "video" || part.kind === "file" || part.kind === "reply");
 }
 
 export function partsToText(parts: InboundMessagePart[], opts: { includeMedia: boolean }): string {
@@ -78,6 +98,10 @@ export function partsToText(parts: InboundMessagePart[], opts: { includeMedia: b
     }
     if (part.kind === "unknown") {
       if (opts.includeMedia) text += part.text;
+      continue;
+    }
+    if (part.kind === "reply") {
+      if (opts.includeMedia) text += replyPlaceholder(part);
       continue;
     }
     if (opts.includeMedia) {
@@ -106,32 +130,28 @@ export function buildOpenClawContent(parts: InboundMessagePart[]): Record<string
       textBuffer += part.text;
       continue;
     }
+    if (part.kind === "reply") {
+      textBuffer += replyPlaceholder(part);
+      for (const quotedPart of part.quotedParts ?? []) {
+        if (quotedPart.kind !== "image" && quotedPart.kind !== "file") continue;
+        if (quotedPart.kind === "file" && !quotedPart.localPath) continue;
+        const mediaBlock = openClawMediaBlock(quotedPart, {
+          quotedReply: {
+            messageId: part.messageId,
+            senderId: part.quotedSenderId,
+            senderName: part.quotedSenderName,
+          },
+        });
+        if (mediaBlock) {
+          flushText();
+          content.push(mediaBlock);
+        }
+      }
+      continue;
+    }
     if (part.kind === "file" && part.localPath) {
       flushText();
-      content.push({
-        type: "file",
-        path: part.localPath,
-        filePath: part.localPath,
-        fileUrl: part.localFileUri,
-        url: part.localFileUri ?? part.localPath,
-        name: part.filename ?? part.file,
-        filename: part.filename ?? part.file,
-        size: part.size,
-        mediaType: part.mime,
-        mime_type: part.mime,
-        alt: mediaPlaceholder(part).trim(),
-        onebot: {
-          type: part.segmentType,
-          file: part.file,
-          fileId: part.fileId,
-          url: part.url,
-          summary: part.summary,
-          size: part.size,
-          localPath: part.localPath,
-          downloadStatus: part.downloadStatus,
-          downloadError: part.downloadError,
-        },
-      });
+      content.push(openClawMediaBlock(part)!);
       continue;
     }
 
@@ -146,38 +166,76 @@ export function buildOpenClawContent(parts: InboundMessagePart[]): Record<string
       content.push({ type: "text", text: mediaPlaceholder(part).trim() });
       continue;
     }
-    content.push({
-      type: "image",
-      url,
-      imageUrl: url,
-      image_url: { url },
+    content.push(openClawMediaBlock(part)!);
+  }
+  flushText();
+  return content.length > 0 ? content : [{ type: "text", text: "" }];
+}
+
+function openClawMediaBlock(part: InboundMediaPart, extraOneBot: Record<string, unknown> = {}): Record<string, unknown> | undefined {
+  if (part.kind === "file") {
+    if (!part.localPath) return undefined;
+    return {
+      type: "file",
+      path: part.localPath,
+      filePath: part.localPath,
+      fileUrl: part.localFileUri,
+      url: part.localFileUri ?? part.localPath,
+      name: part.filename ?? part.file,
+      filename: part.filename ?? part.file,
+      size: part.size,
       mediaType: part.mime,
       mime_type: part.mime,
-      filename: part.filename ?? part.file,
       alt: mediaPlaceholder(part).trim(),
       onebot: {
         type: part.segmentType,
         file: part.file,
+        fileId: part.fileId,
         url: part.url,
         summary: part.summary,
         size: part.size,
         localPath: part.localPath,
         downloadStatus: part.downloadStatus,
         downloadError: part.downloadError,
+        ...extraOneBot,
       },
-    });
+    };
   }
-  flushText();
-  return content.length > 0 ? content : [{ type: "text", text: "" }];
+
+  if (part.kind !== "image") return undefined;
+  const url = part.localFileUri ?? part.url ?? part.source ?? part.file;
+  if (!url) return undefined;
+  return {
+    type: "image",
+    url,
+    imageUrl: url,
+    image_url: { url },
+    mediaType: part.mime,
+    mime_type: part.mime,
+    filename: part.filename ?? part.file,
+    alt: mediaPlaceholder(part).trim(),
+    onebot: {
+      type: part.segmentType,
+      file: part.file,
+      url: part.url,
+      summary: part.summary,
+      size: part.size,
+      localPath: part.localPath,
+      downloadStatus: part.downloadStatus,
+      downloadError: part.downloadError,
+      ...extraOneBot,
+    },
+  };
 }
 
 export function buildAgentMediaPayloadFromParts(parts: InboundMessagePart[]): Record<string, unknown> {
-  const media = parts.flatMap((part) => {
+  const flatParts = flattenQuotedParts(parts);
+  const media = flatParts.flatMap((part) => {
     if (part.kind !== "image") return [];
       const path = agentReadableMediaPath(part);
     return path ? [{ path, contentType: part.mime }] : [];
   });
-  const files = parts.flatMap((part) => {
+  const files = flatParts.flatMap((part) => {
     if (part.kind !== "file" || !part.localPath) return [];
     return [{ path: part.localPath, name: part.filename ?? part.file, contentType: part.mime, size: part.size }];
   });
@@ -208,8 +266,19 @@ export function buildAgentMediaPayloadFromParts(parts: InboundMessagePart[]): Re
   return payload;
 }
 
+function flattenQuotedParts(parts: InboundMessagePart[]): InboundMessagePart[] {
+  const flattened: InboundMessagePart[] = [];
+  for (const part of parts) {
+    flattened.push(part);
+    if (part.kind === "reply" && part.quotedParts?.length) {
+      flattened.push(...flattenQuotedParts(part.quotedParts));
+    }
+  }
+  return flattened;
+}
+
 export function summarizeMediaParts(parts: InboundMessagePart[]): Record<string, unknown>[] {
-  return parts
+  return flattenQuotedParts(parts)
     .filter((part): part is InboundMediaPart => part.kind === "image" || part.kind === "record" || part.kind === "video" || part.kind === "file")
     .map((part) => ({
       kind: part.kind,
@@ -243,6 +312,19 @@ export function mediaPlaceholder(part: InboundMediaPart): string {
     return `\n[file: ${name}]\n[download failed: ${part.downloadError}]\n`;
   }
   return `\n[${part.kind}: ${name}]\n`;
+}
+
+export function replyPlaceholder(part: InboundReplyPart): string {
+  const id = part.messageId ? ` #${part.messageId}` : "";
+  const sender = part.quotedSenderName || part.quotedSenderId;
+  const from = sender ? ` from ${sender}` : "";
+  if (part.resolveStatus === "resolved" && part.quotedText?.trim()) {
+    return `\n[reply${id}${from}]\n${part.quotedText.trim()}\n[/reply]\n`;
+  }
+  if (part.resolveStatus === "failed" && part.resolveError) {
+    return `\n[reply${id}: unavailable (${part.resolveError})]\n`;
+  }
+  return `\n[reply${id}]\n`;
 }
 
 export function parseRawOneBotMessage(raw: string): OneBotMessageSegment[] {
@@ -284,10 +366,77 @@ function partFromSegment(segment: OneBotMessageSegment, opts: ExtractInboundPart
     if (self && opts.stripMention) return [];
     return qq ? [{ kind: "mention", qq, text: `@${qq}`, self }] : [];
   }
+  if (segment.type === "reply" || segment.type === "quote") {
+    const messageId = idString(data.id) ?? idString(data.message_id) ?? idString(data.messageId);
+    return [{
+      kind: "reply",
+      segmentType: segment.type,
+      data,
+      messageId,
+      resolveStatus: messageId ? "skipped" : "failed",
+      resolveError: messageId ? undefined : "missing-message-id",
+    }];
+  }
   if (isInboundMediaKind(segment.type)) {
     return [mediaPartFromSegment(segment.type, data)];
   }
   return [{ kind: "unknown", segmentType: segment.type, data, text: `\n[${segment.type}]\n` }];
+}
+
+async function resolveReplyPart(
+  part: InboundReplyPart,
+  config: OneBotHookConfig,
+  logger: LoggerLike,
+  resolveImage?: ResolveOneBotImageSource,
+  resolveFile?: ResolveOneBotFileSource,
+  resolveReply?: ResolveOneBotReplySource,
+  replyDepth = 0
+): Promise<InboundReplyPart> {
+  if (!part.messageId || !resolveReply) return part;
+  try {
+    const resolved = await resolveReply(part);
+    if (!resolved || typeof resolved !== "object") return part;
+    const quotedParts = quotedMessageParts(resolved);
+    const preparedQuotedParts = replyDepth >= 2
+      ? quotedParts
+      : await prepareInboundMediaPartsInternal(
+        quotedParts,
+        config,
+        logger,
+        resolveImage,
+        resolveFile,
+        undefined,
+        replyDepth + 1,
+      );
+    const quotedText = partsToText(preparedQuotedParts, { includeMedia: true });
+    return {
+      ...part,
+      data: { ...part.data, _resolved: resolved },
+      quotedParts: preparedQuotedParts,
+      quotedText,
+      quotedSenderId: idString(resolved.user_id) ?? idString(resolved.sender?.user_id),
+      quotedSenderName: resolved.sender?.card?.trim() || resolved.sender?.nickname?.trim() || undefined,
+      resolveStatus: quotedText ? "resolved" : "skipped",
+      resolveError: undefined,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn?.(`[onebot-hook] get_msg failed for reply ${part.messageId}: ${message}`);
+    return { ...part, resolveStatus: "failed", resolveError: message };
+  }
+}
+
+function quotedMessageParts(message: OneBotMessageData): InboundMessagePart[] {
+  const segments = Array.isArray(message.message)
+    ? message.message
+    : parseRawOneBotMessage(typeof message.message === "string" ? message.message : (message.raw_message ?? ""));
+  const parts = segments.flatMap((segment) => {
+    if (segment.type === "reply" || segment.type === "quote") return [];
+    return partFromSegment(segment, { stripMention: false });
+  });
+  if (parts.length > 0) return parts;
+  const fallback = stringValue(message.raw_message);
+  return fallback ? [{ kind: "text", text: fallback }] : [];
 }
 
 function mediaPartFromSegment(kind: InboundMediaKind, data: Record<string, unknown>): InboundMediaPart {
@@ -667,6 +816,11 @@ function decodeCqText(value: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function idString(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return stringValue(value);
 }
 
 function numberValue(value: unknown): number | undefined {

@@ -249,6 +249,80 @@ describe("inbound media preparation", () => {
     expect(await readFile(file!.localPath!, "utf8")).toBe("zip");
   });
 
+  it("resolves OneBot reply segments into model-readable quote text", async () => {
+    const cacheDir = await makeTempDir();
+    const parts = extractInboundParts({
+      post_type: "message",
+      message_type: "private",
+      self_id: 42,
+      user_id: 10001,
+      message: [
+        { type: "reply", data: { id: 123 } },
+        { type: "text", data: { text: " 我的引用看得到么" } },
+      ],
+    });
+
+    expect(partsToText(parts, { includeMedia: false })).toBe("我的引用看得到么");
+    expect(partsToText(parts, { includeMedia: true })).toContain("[reply #123]");
+
+    const prepared = await prepareInboundMediaParts(
+      parts,
+      config(cacheDir),
+      {},
+      undefined,
+      undefined,
+      async () => ({
+        message_id: 123,
+        user_id: 20002,
+        sender: { nickname: "鸦羽绯夜" },
+        message: [{ type: "text", data: { text: "正在被主人的 B草。" } }],
+      }),
+    );
+
+    expect(partsToText(prepared, { includeMedia: true })).toBe(
+      "[reply #123 from 鸦羽绯夜]\n正在被主人的 B草。\n[/reply]\n我的引用看得到么",
+    );
+  });
+
+  it("downloads images inside quoted OneBot reply messages", async () => {
+    const cacheDir = await makeTempDir();
+    const parts = extractInboundParts({
+      post_type: "message",
+      message_type: "group",
+      self_id: 42,
+      user_id: 10001,
+      group_id: 90001,
+      message: [
+        { type: "reply", data: { id: 123 } },
+        { type: "at", data: { qq: 42 } },
+        { type: "text", data: { text: " COS一下" } },
+      ],
+    });
+
+    const prepared = await prepareInboundMediaParts(
+      parts,
+      config(cacheDir),
+      {},
+      async () => ({
+        file: "quoted.png",
+        url: "base64://iVBORw0KGgo=",
+      }),
+      undefined,
+      async () => ({
+        message_id: 123,
+        user_id: 20002,
+        sender: { nickname: "锡纸烤盘韩科长" },
+        message: [{ type: "image", data: { file: "quoted.png" } }],
+      }),
+    );
+    const text = partsToText(prepared, { includeMedia: true });
+
+    expect(text).toContain("[reply #123 from 锡纸烤盘韩科长]");
+    expect(text).toContain("[image: quoted.png]");
+    expect(text).toContain("[path: ");
+    expect(text).toContain("COS一下");
+  });
+
   it("keeps file metadata when an inbound file exceeds the configured size limit", async () => {
     const cacheDir = await makeTempDir();
     const parts = extractInboundParts({

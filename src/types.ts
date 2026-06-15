@@ -93,6 +93,19 @@ export interface InboundMentionPart {
   self: boolean;
 }
 
+export interface InboundReplyPart {
+  kind: "reply";
+  segmentType: string;
+  data: Record<string, unknown>;
+  messageId?: string;
+  quotedParts?: InboundMessagePart[];
+  quotedText?: string;
+  quotedSenderId?: string;
+  quotedSenderName?: string;
+  resolveStatus?: "resolved" | "skipped" | "failed";
+  resolveError?: string;
+}
+
 export interface InboundMediaPart {
   kind: InboundMediaKind;
   segmentType: string;
@@ -118,7 +131,7 @@ export interface InboundUnknownPart {
   text: string;
 }
 
-export type InboundMessagePart = InboundTextPart | InboundMentionPart | InboundMediaPart | InboundUnknownPart;
+export type InboundMessagePart = InboundTextPart | InboundMentionPart | InboundReplyPart | InboundMediaPart | InboundUnknownPart;
 
 export interface OneBotMessageEvent {
   time?: number;
@@ -164,6 +177,18 @@ export interface OneBotImageData {
   url?: string;
   path?: string;
   filename?: string;
+  [key: string]: unknown;
+}
+
+export interface OneBotMessageData {
+  message_id?: number | string;
+  real_id?: number | string;
+  sender?: OneBotSenderInfo;
+  user_id?: number | string;
+  group_id?: number | string;
+  message?: string | OneBotMessageSegment[];
+  raw_message?: string;
+  time?: number;
   [key: string]: unknown;
 }
 

@@ -329,9 +329,19 @@ async function prepareInboundPromptText(config, decision, message, target) {
       return response?.data ?? { file: part.file };
     },
     async (part) => resolveOneBotInboundFile(client, target, part),
+    async (part) => resolveOneBotReply(client, part),
   );
   logPreparedInboundMedia(preparedParts, target);
   return partsToText(preparedParts, { includeMedia: true }) || decision.promptText || decision.text;
+}
+
+async function resolveOneBotReply(client, part) {
+  if (!part?.messageId || typeof client.getMsg !== "function") return undefined;
+  const response = await client.getMsg(part.messageId);
+  if (!response || !isOkResponse(response)) {
+    throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+  }
+  return response?.data;
 }
 
 async function resolveOneBotInboundFile(client, target, part) {

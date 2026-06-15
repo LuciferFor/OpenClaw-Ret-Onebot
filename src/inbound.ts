@@ -159,6 +159,13 @@ export async function processInboundMessage(
       throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
     }
     return response?.data ?? { file: part.file, file_id: part.fileId };
+  }, async (part) => {
+    if (!part.messageId || typeof (client as any).getMsg !== "function") return undefined;
+    const response = await (client as any).getMsg(part.messageId);
+    if (!response || !isOkResponse(response)) {
+      throw new Error(response?.message ?? response?.wording ?? `retcode ${response?.retcode ?? "unknown"}`);
+    }
+    return response?.data;
   });
   const content = buildOpenClawContent(preparedParts);
   const mediaPayload = buildAgentMediaPayloadFromParts(preparedParts);

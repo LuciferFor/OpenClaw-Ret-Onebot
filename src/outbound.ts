@@ -349,7 +349,7 @@ export class ReplyChunkSender {
     this.partsBuffer = [];
     if (parts.length === 0) return;
 
-    const message = replyPartsToOneBotMessage(parts);
+    const message = await replyPartsToOneBotMessage(parts, this.config, this.logger);
     const messageId = await this.sendMessage(this.target, message);
     this.sent.push({ target: this.target, text: summarizeReplyParts(parts), message, messageId });
   }
@@ -408,7 +408,11 @@ export class ReplyChunkSender {
   }
 }
 
-function replyPartsToOneBotMessage(parts: ReplyPart[]): OneBotOutgoingMessage {
+async function replyPartsToOneBotMessage(
+  parts: ReplyPart[],
+  config: Pick<OneBotHookConfig, "media">,
+  logger: LoggerLike = {}
+): Promise<OneBotOutgoingMessage> {
   const hasImage = parts.some((part) => part.kind === "image");
   if (!hasImage) return parts.filter((part) => part.kind === "text").map((part) => part.text).join("");
 
@@ -419,7 +423,13 @@ function replyPartsToOneBotMessage(parts: ReplyPart[]): OneBotOutgoingMessage {
       continue;
     }
     if (part.kind === "file") continue;
-    segments.push({ type: "image", data: { file: normalizeOutboundImageSource(part.url), ...(part.alt ? { summary: part.alt } : {}) } });
+    segments.push({
+      type: "image",
+      data: {
+        file: await resolveOutboundImageSource(part.url, config, logger),
+        ...(part.alt ? { summary: part.alt } : {}),
+      },
+    });
   }
   return segments;
 }
@@ -664,6 +674,7 @@ function formatBytes(value: number): string {
 
 export function normalizeOutboundImageSource(value: string | undefined, config?: Pick<OneBotHookConfig, "media">): string | undefined {
   if (!value) return undefined;
+  if (isOpenClawMediaApiPath(value)) return value;
   const dataUri = /^data:image\/[a-z0-9.+-]+;base64,([\s\S]+)$/i.exec(value);
   if (dataUri) return `base64://${dataUri[1].replace(/\s+/g, "")}`;
   if (/^base64:\/\//i.test(value)) return value;
@@ -677,6 +688,85 @@ export function normalizeOutboundImageSource(value: string | undefined, config?:
     return local ?? pathToFileURL(value).href;
   }
   return value;
+}
+
+async function resolveOutboundImageSource(
+  value: string | undefined,
+  config: Pick<OneBotHookConfig, "media">,
+  logger: LoggerLike = {}
+): Promise<string | undefined> {
+  const normalized = normalizeOutboundImageSource(value, config);
+  if (!normalized || !isOpenClawMediaApiPath(normalized)) return normalized;
+  try {
+    return await fetchOpenClawMediaAsBase64(normalized, config);
+  } catch (error) {
+    logger.warn?.(`[onebot-hook] failed to fetch OpenClaw media ${normalized}: ${error instanceof Error ? error.message : String(error)}`);
+    return normalized;
+  }
+}
+
+async function fetchOpenClawMediaAsBase64(pathname: string, config: Pick<OneBotHookConfig, "media">): Promise<string> {
+  const base = openClawGatewayHttpBase();
+  const url = new URL(pathname, base);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.media.downloadTimeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: openClawGatewayHttpHeaders(url),
+    });
+    if (!response.ok) throw new Error(`OpenClaw media HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType && !/^image\//i.test(contentType)) {
+      throw new Error(`OpenClaw media is not an image (${contentType})`);
+    }
+    const length = Number.parseInt(response.headers.get("content-length") ?? "", 10);
+    if (Number.isFinite(length) && length > config.media.maxImageBytes) {
+      throw new Error(`image exceeds maxImageBytes (${length})`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > config.media.maxImageBytes) {
+      throw new Error(`image exceeds maxImageBytes (${bytes.length})`);
+    }
+    return `base64://${bytes.toString("base64")}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function openClawGatewayHttpBase(): string {
+  const explicit = process.env.OPENCLAW_GATEWAY_HTTP_URL?.trim();
+  if (explicit) return explicit.endsWith("/") ? explicit : `${explicit}/`;
+  const ws = process.env.OPENCLAW_GATEWAY_WS?.trim();
+  if (ws) {
+    try {
+      const parsed = new URL(ws);
+      parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+      parsed.pathname = "/";
+      parsed.search = "";
+      parsed.hash = "";
+      return parsed.href;
+    } catch {
+      // Fall through to the local default.
+    }
+  }
+  return "http://127.0.0.1:18789/";
+}
+
+function openClawGatewayHttpHeaders(url: URL): Record<string, string> {
+  const headers: Record<string, string> = {
+    Origin: url.origin,
+    "X-Forwarded-Proto": url.protocol.replace(/:$/, ""),
+    "X-Forwarded-Host": url.host,
+    "X-Forwarded-User": process.env.OPENCLAW_TRUSTED_USER?.trim() || "lan@openclaw.local",
+  };
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+function isOpenClawMediaApiPath(value: string): boolean {
+  return /^\/api\/chat\/media\//i.test(value.trim());
 }
 
 function fileUriToPath(value: string): string | undefined {

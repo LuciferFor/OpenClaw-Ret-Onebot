@@ -52,6 +52,12 @@ function config(overrides: Partial<OneBotHookConfig["reply"]> = {}, fileOverride
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  delete process.env.OPENCLAW_GATEWAY_HTTP_URL;
+  delete process.env.OPENCLAW_GATEWAY_WS;
+  delete process.env.OPENCLAW_GATEWAY_TOKEN;
+  delete process.env.OPENCLAW_TRUSTED_USER;
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) await rm(dir, { recursive: true, force: true });
@@ -206,6 +212,43 @@ describe("ReplyChunkSender", () => {
         { type: "text", data: { text: "caption" } },
         { type: "image", data: { file: "https://example.test/a.png" } },
         { type: "image", data: { file: "https://example.test/b.png" } },
+      ],
+    ]);
+  });
+
+  it("downloads OpenClaw relative media API images before sending", async () => {
+    process.env.OPENCLAW_GATEWAY_WS = "ws://127.0.0.1:18789/";
+    process.env.OPENCLAW_TRUSTED_USER = "lan@openclaw.local";
+    const fetchMock = vi.fn(async () => new Response("png", {
+      status: 200,
+      headers: {
+        "content-type": "image/png",
+        "content-length": "3",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return "m1";
+      }
+    );
+
+    await sender.deliver({
+      text: "好了",
+      mediaUrl: "/api/chat/media/outgoing/agent%3Amain%3Aonebot%3Adirect%3A10001/abc/full",
+    }, { kind: "final" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    expect(String(url)).toBe("http://127.0.0.1:18789/api/chat/media/outgoing/agent%3Amain%3Aonebot%3Adirect%3A10001/abc/full");
+    expect((init.headers as Record<string, string>)["X-Forwarded-User"]).toBe("lan@openclaw.local");
+    expect(sends).toEqual([
+      [
+        { type: "text", data: { text: "好了" } },
+        { type: "image", data: { file: "base64://cG5n" } },
       ],
     ]);
   });

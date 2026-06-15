@@ -8,6 +8,7 @@ import type {
   OneBotApiResponse,
   OneBotHookConfig,
   OneBotImageData,
+  OneBotMessageData,
   OneBotMessageEvent,
   OneBotOutgoingMessage,
   OneBotSendData,
@@ -119,6 +120,13 @@ export class OneBotClient extends EventEmitter {
       group_id: groupId,
       group: groupId,
       file_id: fileId,
+    });
+  }
+
+  async getMsg(messageId: string | number): Promise<OneBotApiResponse<OneBotMessageData>> {
+    const normalizedMessageId = typeof messageId === "string" && /^\d+$/.test(messageId) ? Number(messageId) : messageId;
+    return this.callApi<OneBotMessageData>("get_msg", {
+      message_id: normalizedMessageId,
     });
   }
 
