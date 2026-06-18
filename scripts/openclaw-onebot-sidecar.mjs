@@ -535,7 +535,7 @@ async function waitAndForwardPendingFinalDelivery(config, target, sessionKey, st
 
 async function sendNoAssistantFallback(config, target, sessionKey, runId, reason) {
   const shortRun = runId ? String(runId).slice(0, 8) : "unknown";
-  const text = `OpenClaw 这轮没有生成可发送回复，已中止。原因：${reason}。run=${shortRun}`;
+  const text = `OpenClaw \u672c\u8f6e\u6ca1\u6709\u751f\u6210\u53ef\u53d1\u9001\u56de\u590d\uff0c\u5df2\u4e2d\u6b62\u3002\u539f\u56e0\uff1a${reason}\u3002run=${shortRun}`;
   await sendAssistantText(config, target, text);
   logger.warn(`sent empty assistant fallback for ${sessionKey} run=${shortRun} reason=${reason}`);
   return true;
