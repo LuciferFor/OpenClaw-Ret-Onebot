@@ -50,6 +50,7 @@ const deduper = new MessageDeduper();
 const sessionQueues = new Map();
 const inboundBuffers = new Map();
 const deliveredAssistantIdsBySession = new Map();
+const deliveredToolResultIdsBySession = new Map();
 let orphanCatchupTimer = null;
 
 function readJson(file, fallback) {
@@ -297,6 +298,16 @@ function deliveredAssistantIds(sessionKey) {
   return ids;
 }
 
+function deliveredToolResultIds(sessionKey) {
+  let ids = deliveredToolResultIdsBySession.get(sessionKey);
+  if (!ids) {
+    ids = new Set();
+    deliveredToolResultIdsBySession.set(sessionKey, ids);
+  }
+  if (ids.size > 1000) ids.clear();
+  return ids;
+}
+
 function targetFromSessionKey(sessionKey) {
   const match = /^agent:[^:]+:onebot:(direct|group):(.+)$/.exec(sessionKey);
   if (!match) return null;
@@ -482,6 +493,21 @@ async function sendAssistantText(config, target, text) {
   await sender.finish();
 }
 
+async function sendToolResultEntry(config, target, entry) {
+  const sender = new ReplyChunkSender(
+    config,
+    target,
+    (captured, outgoing) => sendOneBotMessageToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, outgoing, logger),
+    logger,
+    {
+      sendFile: (captured, file) => sendOneBotFileToCapturedTarget(currentClient ?? new OneBotClient(config, logger), config, captured, file, logger),
+    },
+  );
+  await sender.deliverToolResult(entry);
+  await sender.finish();
+  return sender.sent.length > 0;
+}
+
 async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
   const pendingFinal = getPendingFinalDelivery(sessionKey, startedAt);
   if (!pendingFinal) return false;
@@ -505,6 +531,14 @@ async function waitAndForwardPendingFinalDelivery(config, target, sessionKey, st
     await sleep(250);
   } while (Date.now() < deadline);
   return false;
+}
+
+async function sendNoAssistantFallback(config, target, sessionKey, runId, reason) {
+  const shortRun = runId ? String(runId).slice(0, 8) : "unknown";
+  const text = `OpenClaw 这轮没有生成可发送回复，已中止。原因：${reason}。run=${shortRun}`;
+  await sendAssistantText(config, target, text);
+  logger.warn(`sent empty assistant fallback for ${sessionKey} run=${shortRun} reason=${reason}`);
+  return true;
 }
 
 function hasVisibleAssistantPayload(message) {
@@ -566,6 +600,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   const deliveredIds = deliveredAssistantIds(sessionKey);
   const progressIds = new Set();
   let sentAny = false;
+  let sentToolOutput = false;
   let lastSentAt = 0;
   let lastProgressAt = startedAt;
   let lastCatchupScanAt = 0;
@@ -619,10 +654,29 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
           yieldDetected = true;
           logger.info(`yield detected for ${sessionKey}; waiting up to max deadline for follow-up completion`);
         }
-        if (trajectoryEntryShowsRunProgress(entry, runId, startedAt) && !progressIds.has(stableId)) {
+        const isCurrentRunProgress = trajectoryEntryShowsRunProgress(entry, runId, startedAt);
+        if (isCurrentRunProgress && !progressIds.has(stableId)) {
           progressIds.add(stableId);
           lastProgressAt = Date.now();
           logger.debug(`run progress ${sessionKey} via trajectory ${entry.type || "event"}`);
+        }
+        if (entry?.type === "tool.result" && isCurrentRunProgress) {
+          const toolResultIds = deliveredToolResultIds(sessionKey);
+          const toolResultId = `tool-result:${runId || "unknown"}:${stableId}`;
+          if (!toolResultIds.has(toolResultId)) {
+            toolResultIds.add(toolResultId);
+            try {
+              const forwarded = await sendToolResultEntry(config, target, entry);
+              if (forwarded) {
+                sentToolOutput = true;
+                lastProgressAt = Date.now();
+                logger.info(`forwarded tool result media ${toolResultId} to ${target.kind}:${target.id}`);
+              }
+            } catch (error) {
+              toolResultIds.delete(toolResultId);
+              logger.warn(`tool result media forward failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+            }
+          }
         }
       }
     }
@@ -643,7 +697,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   if (!sentAny) {
     if (file) await processEntries(readAllEntries(file), "final-catchup");
     if (sentAny) return true;
-    if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort")) return true;
+    if (!sentToolOutput && await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort")) return true;
   }
   if (!sentAny && runId && !yieldDetected) {
     const waitedMs = Date.now() - startedAt;
@@ -655,12 +709,14 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     } catch (error) {
       logger.warn(`abort timed out run failed for ${sessionKey}: ${error.message || String(error)}`);
     }
-    if (await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
+    if (!sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
+    if (!sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output");
   } else {
     logger.warn(`assistant timeout for ${sessionKey}${yieldDetected ? " after yielded wait" : ""}`);
-    if (!sentAny && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
+    if (!sentAny && !sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
+    if (!sentAny && !sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output");
   }
-  return sentAny;
+  return sentAny || sentToolOutput;
 }
 
 async function catchUpOrphanedOneBotSessions(config) {

@@ -303,6 +303,68 @@ describe("ReplyChunkSender", () => {
     ]);
   });
 
+  it("sends explicit LOCAL_ONLY image paths from tool result text", async () => {
+    const file = await makeTempFile("generated.png", "png");
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      }
+    );
+
+    await sender.deliverToolResult(`[2026-06-16] GENERATED_FILE\nLOCAL_ONLY:${file}`);
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "base64://cG5n" } }],
+    ]);
+  });
+
+  it("sends explicit local image paths from nested trajectory tool results", async () => {
+    const file = await makeTempFile("trajectory-output.png", "png");
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "group", id: 90001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      }
+    );
+
+    await sender.deliverToolResult({
+      type: "tool.result",
+      data: {
+        result: {
+          output: `tool log\nLOCAL_ONLY:${file}\ncompleted`,
+        },
+      },
+    });
+
+    expect(sends).toEqual([
+      [{ type: "image", data: { file: "base64://cG5n" } }],
+    ]);
+  });
+
+  it("ignores missing local image placeholders in tool result text", async () => {
+    const sends: OneBotOutgoingMessage[] = [];
+    const sender = new ReplyChunkSender(
+      config(),
+      { kind: "private", id: 10001 },
+      async (_target, message) => {
+        sends.push(message);
+        return `m${sends.length}`;
+      }
+    );
+
+    await sender.deliverToolResult("example image path: /absolute/path/reference.jpg");
+    await sender.finish();
+
+    expect(sends).toEqual([]);
+  });
+
   it("deduplicates images across tool and final replies", async () => {
     const sends: OneBotOutgoingMessage[] = [];
     const sender = new ReplyChunkSender(

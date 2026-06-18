@@ -11,6 +11,10 @@ type ReplyPayload = string | {
   body?: unknown;
   content?: unknown;
   contentItems?: unknown;
+  data?: unknown;
+  output?: unknown;
+  result?: unknown;
+  message?: unknown;
   mediaUrl?: unknown;
   mediaUrls?: unknown;
   dataUri?: unknown;
@@ -33,6 +37,8 @@ type ReplyPart =
 
 const MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g;
 const QQMEDIA_PATTERN = /<qqmedia>\s*([\s\S]*?)\s*<\/qqmedia>/gi;
+const LOCAL_ONLY_PATTERN = /\bLOCAL_ONLY:([^\r\n]+)/giu;
+const LOCAL_IMAGE_PATH_PATTERN = /(?:^|[\s(["'：:])((?:\/[^\s`"'<>]+|[A-Za-z]:\\[^\s`"'<>]+)\.(?:png|jpe?g|gif|webp|bmp|svg))(?:$|[\s.,，。;；!！?？)\]】》])/gimu;
 const DEFAULT_OUTBOUND_IMAGE_MAX_BYTES = 15_000_000;
 
 export interface ReplyFilePart {
@@ -225,7 +231,7 @@ export class ReplyChunkSender {
 
   private extractParts(payload: ReplyPayload, opts: { mediaOnly?: boolean; textLinksOnly?: boolean } = {}): ReplyPart[] {
     if (typeof payload === "string") {
-      if (opts.mediaOnly) return opts.textLinksOnly ? this.extractToolResultLinkText(payload) : [];
+      if (opts.mediaOnly) return this.extractToolResultTextParts(payload, opts);
       return this.extractTextAndMarkdownImages(payload);
     }
     if (!payload || typeof payload !== "object") return [];
@@ -243,6 +249,7 @@ export class ReplyChunkSender {
     if (directImage) parts.push({ kind: "image", url: directImage });
     const directFile = filePartFromContentItem(payload as Record<string, unknown>, this.config, false);
     if (directFile) parts.push(directFile);
+    if (opts.mediaOnly) parts.push(...this.extractNestedToolResultParts(payload as Record<string, unknown>, opts));
     return parts;
   }
 
@@ -250,7 +257,8 @@ export class ReplyChunkSender {
     const parts: ReplyPart[] = [];
     for (const item of content) {
       if (typeof item === "string") {
-        if (!opts.mediaOnly) parts.push(...this.extractTextAndMarkdownImages(item));
+        if (opts.mediaOnly) parts.push(...this.extractToolResultTextParts(item, opts));
+        else parts.push(...this.extractTextAndMarkdownImages(item));
         continue;
       }
       if (!item || typeof item !== "object") continue;
@@ -259,7 +267,7 @@ export class ReplyChunkSender {
       if (type === "text") {
         const text = stringValue(value.text) ?? "";
         if (opts.mediaOnly) {
-          if (opts.textLinksOnly) parts.push(...this.extractToolResultLinkText(text));
+          parts.push(...this.extractToolResultTextParts(text, opts));
         } else {
           parts.push(...this.extractTextAndMarkdownImages(text));
         }
@@ -277,10 +285,38 @@ export class ReplyChunkSender {
     return parts;
   }
 
+  private extractToolResultTextParts(input: string, opts: { textLinksOnly?: boolean } = {}): ReplyPart[] {
+    const parts: ReplyPart[] = [];
+    if (this.config.media.enabled) {
+      parts.push(...explicitImagePartsFromText(input, this.config));
+    }
+    if (opts.textLinksOnly) parts.push(...this.extractToolResultLinkText(input));
+    return dedupeReplyParts(parts);
+  }
+
   private extractToolResultLinkText(input: string): ReplyPart[] {
     const text = this.prepareText(input);
     if (!text || !hasUsefulLink(text)) return [];
     return [{ kind: "text", text, rawText: input }];
+  }
+
+  private extractNestedToolResultParts(value: unknown, opts: { mediaOnly?: boolean; textLinksOnly?: boolean }, seen = new WeakSet<object>(), depth = 0): ReplyPart[] {
+    if (depth > 8 || value == null) return [];
+    if (typeof value === "string") return this.extractToolResultTextParts(value, opts);
+    if (Array.isArray(value)) return value.flatMap((item) => this.extractNestedToolResultParts(item, opts, seen, depth + 1));
+    if (typeof value !== "object") return [];
+    if (seen.has(value)) return [];
+    seen.add(value);
+    const record = value as Record<string, unknown>;
+    const parts: ReplyPart[] = [];
+    const imageUrl = imageUrlFromContentItem(record, this.config);
+    if (imageUrl) parts.push({ kind: "image", url: imageUrl, alt: stringValue(record.alt) });
+    const file = filePartFromContentItem(record, this.config, false);
+    if (file) parts.push(file);
+    for (const key of ["content", "contentItems", "data", "output", "result", "message", "toolResult", "response", "payload"]) {
+      parts.push(...this.extractNestedToolResultParts(record[key], opts, seen, depth + 1));
+    }
+    return dedupeReplyParts(parts);
   }
 
   private extractTextAndMarkdownImages(input: string): ReplyPart[] {
@@ -514,6 +550,75 @@ function qqMediaPartsFromSource(source: string, config: OneBotHookConfig): Reply
   }
   const file = filePartFromSource(value, undefined, config, false);
   return file ? [file] : [];
+}
+
+function explicitImagePartsFromText(input: string, config: OneBotHookConfig): ReplyPart[] {
+  const parts: ReplyPart[] = [];
+
+  const qqMediaPattern = new RegExp(QQMEDIA_PATTERN.source, "gi");
+  let mediaMatch: RegExpExecArray | null;
+  while ((mediaMatch = qqMediaPattern.exec(input)) !== null) {
+    parts.push(...qqMediaPartsFromSource(mediaMatch[1], config));
+  }
+
+  if (config.media.markdownImages) {
+    const markdownPattern = new RegExp(MARKDOWN_IMAGE_PATTERN.source, "g");
+    let markdownMatch: RegExpExecArray | null;
+    while ((markdownMatch = markdownPattern.exec(input)) !== null) {
+      const url = normalizeExplicitToolImageSource(markdownMatch[2].replace(/^<|>$/g, ""), config);
+      if (url) parts.push({ kind: "image", url, alt: markdownMatch[1] || undefined });
+    }
+  }
+
+  const localOnlyPattern = new RegExp(LOCAL_ONLY_PATTERN.source, "giu");
+  let localOnlyMatch: RegExpExecArray | null;
+  while ((localOnlyMatch = localOnlyPattern.exec(input)) !== null) {
+    const source = trimPathCandidate(localOnlyMatch[1]);
+    if (!isLikelyImageSource(source)) continue;
+    const url = normalizeExplicitToolImageSource(source, config);
+    if (url) parts.push({ kind: "image", url });
+  }
+
+  const localImagePattern = new RegExp(LOCAL_IMAGE_PATH_PATTERN.source, "gimu");
+  let pathMatch: RegExpExecArray | null;
+  while ((pathMatch = localImagePattern.exec(input)) !== null) {
+    const source = trimPathCandidate(pathMatch[1]);
+    const url = normalizeExplicitToolImageSource(source, config);
+    if (url) parts.push({ kind: "image", url });
+  }
+
+  return dedupeReplyParts(parts);
+}
+
+function normalizeExplicitToolImageSource(source: string, config: OneBotHookConfig): string | undefined {
+  const value = source.trim();
+  if (!value) return undefined;
+  if (/^https?:\/\//i.test(value) || /^data:image\//i.test(value) || /^base64:\/\//i.test(value) || isOpenClawMediaApiPath(value)) {
+    return normalizeOutboundImageSource(value, config);
+  }
+  if (/^file:\/\//i.test(value)) {
+    return localImageFileToBase64(fileUriToPath(value), config);
+  }
+  if (isAbsolute(value)) {
+    return localImageFileToBase64(value, config);
+  }
+  return normalizeOutboundImageSource(value, config);
+}
+
+function dedupeReplyParts(parts: ReplyPart[]): ReplyPart[] {
+  const seen = new Set<string>();
+  const result: ReplyPart[] = [];
+  for (const part of parts) {
+    const key = part.kind === "text"
+      ? `text:${part.text}`
+      : part.kind === "image"
+        ? `image:${part.url}`
+        : `file:${part.file}\n${part.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(part);
+  }
+  return result;
 }
 
 function mediaPattern(markdownImages: boolean): RegExp {
