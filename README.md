@@ -80,6 +80,16 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
           }
         ],
         "fallbackOnFailure": "text"
+      },
+      "interrupt": {
+        "enabled": true,
+        "mode": "abort_and_resend",
+        "sameSenderOnly": true,
+        "debounceMs": 800,
+        "followupWindowMs": 120000,
+        "maxBufferedMessages": 8,
+        "suppressSupersededReplies": true,
+        "interruptAfterOutput": false
       }
     }
   }
@@ -88,6 +98,7 @@ If another OneBot plugin such as `openclaw-onebot` is enabled, disable it first.
 
 Private messages are forwarded by default. Group messages are forwarded only when the bot is mentioned or a configured keyword is present. Image + text messages preserve their OneBot segment order; inbound images are cached locally when possible and outbound images are sent as OneBot `image` segments. File attachments are uploaded with OneBot/NapCat `upload_private_file` or `upload_group_file`; assistant text paths are only auto-uploaded when they point at a real file under `channels.onebot.files.allowedRoots`.
 Inbound OneBot `file` segments are downloaded into `channels.onebot.files.incomingDir` when OneBot exposes a URL, local path, base64 source, or a resolvable `get_file` result. The saved path is added to OpenClaw as `FilePath` / `FilePaths` and as a readable `[path: ...]` line in the prompt.
+When a user sends another message in the same OneBot conversation before OpenClaw has replied, `channels.onebot.interrupt` can abort the old run and resend a fixed correction guide. In groups, an unmentioned follow-up is accepted only from the same sender within the active follow-up window.
 
 ## Verify
 

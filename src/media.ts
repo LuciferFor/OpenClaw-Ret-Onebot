@@ -72,7 +72,7 @@ async function prepareInboundMediaPartsInternal(
       prepared.push(await downloadImagePart(part, config, logger, resolveImage));
       continue;
     }
-    if (part.kind === "file") {
+    if (part.kind === "file" || part.kind === "video" || part.kind === "record") {
       prepared.push(await downloadFilePart(part, config, logger, resolveFile));
       continue;
     }
@@ -133,8 +133,8 @@ export function buildOpenClawContent(parts: InboundMessagePart[]): Record<string
     if (part.kind === "reply") {
       textBuffer += replyPlaceholder(part);
       for (const quotedPart of part.quotedParts ?? []) {
-        if (quotedPart.kind !== "image" && quotedPart.kind !== "file") continue;
-        if (quotedPart.kind === "file" && !quotedPart.localPath) continue;
+        if (!isOpenClawMediaPart(quotedPart)) continue;
+        if (quotedPart.kind !== "image" && !quotedPart.localPath) continue;
         const mediaBlock = openClawMediaBlock(quotedPart, {
           quotedReply: {
             messageId: part.messageId,
@@ -149,7 +149,7 @@ export function buildOpenClawContent(parts: InboundMessagePart[]): Record<string
       }
       continue;
     }
-    if (part.kind === "file" && part.localPath) {
+    if ((part.kind === "file" || part.kind === "video" || part.kind === "record") && part.localPath) {
       flushText();
       content.push(openClawMediaBlock(part)!);
       continue;
@@ -173,16 +173,18 @@ export function buildOpenClawContent(parts: InboundMessagePart[]): Record<string
 }
 
 function openClawMediaBlock(part: InboundMediaPart, extraOneBot: Record<string, unknown> = {}): Record<string, unknown> | undefined {
-  if (part.kind === "file") {
+  if (part.kind === "file" || part.kind === "video" || part.kind === "record") {
     if (!part.localPath) return undefined;
+    const type = part.kind === "record" ? "audio" : part.kind;
     return {
-      type: "file",
+      type,
       path: part.localPath,
       filePath: part.localPath,
       fileUrl: part.localFileUri,
       url: part.localFileUri ?? part.localPath,
       name: part.filename ?? part.file,
       filename: part.filename ?? part.file,
+      mediaKind: part.kind,
       size: part.size,
       mediaType: part.mime,
       mime_type: part.mime,
@@ -228,15 +230,19 @@ function openClawMediaBlock(part: InboundMediaPart, extraOneBot: Record<string, 
   };
 }
 
+function isOpenClawMediaPart(part: InboundMessagePart): part is InboundMediaPart {
+  return part.kind === "image" || part.kind === "file" || part.kind === "video" || part.kind === "record";
+}
+
 export function buildAgentMediaPayloadFromParts(parts: InboundMessagePart[]): Record<string, unknown> {
   const flatParts = flattenQuotedParts(parts);
   const media = flatParts.flatMap((part) => {
-    if (part.kind !== "image") return [];
+    if (part.kind !== "image" && part.kind !== "video" && part.kind !== "record") return [];
       const path = agentReadableMediaPath(part);
-    return path ? [{ path, contentType: part.mime }] : [];
+    return path ? [{ path, kind: part.kind, contentType: part.mime }] : [];
   });
   const files = flatParts.flatMap((part) => {
-    if (part.kind !== "file" || !part.localPath) return [];
+    if ((part.kind !== "file" && part.kind !== "video" && part.kind !== "record") || !part.localPath) return [];
     return [{ path: part.localPath, name: part.filename ?? part.file, contentType: part.mime, size: part.size }];
   });
 
@@ -250,6 +256,8 @@ export function buildAgentMediaPayloadFromParts(parts: InboundMessagePart[]): Re
     payload.MediaPaths = paths;
     payload.MediaUrls = paths;
     if (first.contentType) payload.MediaType = first.contentType;
+    payload.MediaKind = first.kind;
+    payload.MediaKinds = media.map((item) => item.kind);
     if (mediaTypes.length > 0) payload.MediaTypes = mediaTypes;
   }
 
@@ -310,6 +318,12 @@ export function mediaPlaceholder(part: InboundMediaPart): string {
   }
   if (part.kind === "file" && part.downloadStatus === "failed" && part.downloadError) {
     return `\n[file: ${name}]\n[download failed: ${part.downloadError}]\n`;
+  }
+  if ((part.kind === "video" || part.kind === "record") && part.localPath) {
+    return `\n[${part.kind}: ${name}]\n[path: ${part.localPath}]\n`;
+  }
+  if ((part.kind === "video" || part.kind === "record") && part.downloadStatus === "failed" && part.downloadError) {
+    return `\n[${part.kind}: ${name}]\n[download failed: ${part.downloadError}]\n`;
   }
   return `\n[${part.kind}: ${name}]\n`;
 }
@@ -613,7 +627,7 @@ async function resolveOneBotImagePart(
 function agentReadableMediaPath(part: InboundMediaPart): string | undefined {
   if (part.localPath) return part.localPath;
   if (part.localFileUri) return part.localFileUri;
-  return chooseReadableImageSource(part);
+  return part.kind === "image" ? chooseReadableImageSource(part) : chooseReadableFileSource(part);
 }
 
 function chooseReadableImageSource(part: InboundMediaPart): string | undefined {

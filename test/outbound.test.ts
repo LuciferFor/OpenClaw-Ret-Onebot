@@ -48,6 +48,16 @@ function config(overrides: Partial<OneBotHookConfig["reply"]> = {}, fileOverride
       fallbackOnFailure: "text",
       ...fileOverrides,
     },
+    interrupt: {
+      enabled: true,
+      mode: "abort_and_resend",
+      sameSenderOnly: true,
+      debounceMs: 800,
+      followupWindowMs: 120_000,
+      maxBufferedMessages: 8,
+      suppressSupersededReplies: true,
+      interruptAfterOutput: false,
+    },
   };
 }
 

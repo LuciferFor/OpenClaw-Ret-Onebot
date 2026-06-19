@@ -40,6 +40,16 @@ function config(cacheDir: string, overrides: Partial<OneBotHookConfig["media"]> 
       pathMappings: [],
       fallbackOnFailure: "text",
     },
+    interrupt: {
+      enabled: true,
+      mode: "abort_and_resend",
+      sameSenderOnly: true,
+      debounceMs: 800,
+      followupWindowMs: 120_000,
+      maxBufferedMessages: 8,
+      suppressSupersededReplies: true,
+      interruptAfterOutput: false,
+    },
   };
 }
 
@@ -68,6 +78,8 @@ describe("inbound media preparation", () => {
       MediaUrl: "/tmp/openclaw/pic.png",
       MediaPaths: ["/tmp/openclaw/pic.png"],
       MediaUrls: ["/tmp/openclaw/pic.png"],
+      MediaKind: "image",
+      MediaKinds: ["image"],
       MediaType: "image/png",
       MediaTypes: ["image/png"],
     });
@@ -220,6 +232,44 @@ describe("inbound media preparation", () => {
       expect(file?.localFileUri).toMatch(/^file:\/\//);
       expect(await readFile(file!.localPath!)).toEqual(bytes);
       expect(payload.FilePath).toBe(file?.localPath);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("downloads inbound video URLs into the configured incoming directory", async () => {
+    const cacheDir = await makeTempDir();
+    const bytes = Buffer.from("mp4-data");
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "video/mp4", "content-length": String(bytes.length) });
+      res.end(bytes);
+    });
+    await listen(server);
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("server address unavailable");
+      const url = `http://127.0.0.1:${address.port}/clip.mp4`;
+      const parts = extractInboundParts({
+        post_type: "message",
+        message_type: "private",
+        self_id: 42,
+        user_id: 10001,
+        message: [{ type: "video", data: { file: "clip.mp4", url, file_size: bytes.length } }],
+      });
+
+      const prepared = await prepareInboundMediaParts(parts, config(cacheDir));
+      const video = prepared.find((part): part is InboundMediaPart => part.kind === "video");
+      const text = partsToText(prepared, { includeMedia: true });
+      const payload = buildAgentMediaPayloadFromParts(prepared);
+
+      expect(video?.downloadStatus).toBe("saved");
+      expect(video?.localPath).toContain("clip.mp4");
+      expect(video?.mime).toBe("video/mp4");
+      expect(await readFile(video!.localPath!)).toEqual(bytes);
+      expect(text).toContain("[video: clip.mp4]");
+      expect(text).toContain("[path: ");
+      expect(payload.MediaPath).toBe(video?.localPath);
+      expect(payload.FilePath).toBe(video?.localPath);
     } finally {
       await close(server);
     }

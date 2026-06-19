@@ -52,6 +52,17 @@ export interface OneBotFileConfig {
   fallbackOnFailure: "text";
 }
 
+export interface OneBotInterruptConfig {
+  enabled: boolean;
+  mode: "abort_and_resend";
+  sameSenderOnly: boolean;
+  debounceMs: number;
+  followupWindowMs: number;
+  maxBufferedMessages: number;
+  suppressSupersededReplies: boolean;
+  interruptAfterOutput: boolean;
+}
+
 export interface OneBotHookConfig {
   enabled: boolean;
   accountId: string;
@@ -64,6 +75,7 @@ export interface OneBotHookConfig {
   reply: OneBotReplyConfig;
   media: OneBotMediaConfig;
   files: OneBotFileConfig;
+  interrupt: OneBotInterruptConfig;
 }
 
 export interface OneBotSenderInfo {

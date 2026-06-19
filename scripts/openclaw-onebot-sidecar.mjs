@@ -40,6 +40,7 @@ const importFromPlugin = async (relativePath) => import(pathToFileURL(path.join(
 const { getOneBotHookConfig } = await importFromPlugin("dist/config.js");
 const { MessageDeduper, OneBotClient, isOkResponse } = await importFromPlugin("dist/onebot-client.js");
 const { decideInbound, buildSessionKey } = await importFromPlugin("dist/inbound.js");
+const { canInterruptRun, formatInterruptGuidance } = await importFromPlugin("dist/interrupt.js");
 const { prepareInboundMediaParts, partsToText } = await importFromPlugin("dist/media.js");
 const { ReplyChunkSender, sendOneBotFileToCapturedTarget, sendOneBotMessageToCapturedTarget } = await importFromPlugin("dist/outbound.js");
 
@@ -49,9 +50,12 @@ let reconnectTimer = null;
 const deduper = new MessageDeduper();
 const sessionQueues = new Map();
 const inboundBuffers = new Map();
+const interruptBuffers = new Map();
+const activeRuns = new Map();
 const deliveredAssistantIdsBySession = new Map();
 const deliveredToolResultIdsBySession = new Map();
 let orphanCatchupTimer = null;
+let activeRunSeq = 0;
 
 function readJson(file, fallback) {
   try {
@@ -316,6 +320,64 @@ function targetFromSessionKey(sessionKey) {
   return { kind: match[1] === "group" ? "group" : "private", id };
 }
 
+function senderKeyFromMessage(message) {
+  const userId = message?.user_id;
+  return userId == null ? undefined : `user:${userId}`;
+}
+
+function activeRunFor(sessionKey) {
+  const run = activeRuns.get(sessionKey);
+  if (!run || run.finished) return undefined;
+  return run;
+}
+
+function canAcceptInterrupt(config, sessionKey, senderId) {
+  return canInterruptRun(config, activeRunFor(sessionKey), senderId);
+}
+
+function startActiveRun(config, sessionKey, target, senderId, messageCount, kind) {
+  const previous = activeRunFor(sessionKey);
+  if (previous && previous.runId && !previous.superseded) {
+    logger.warn(`active run replaced without supersede ${sessionKey} old=${previous.runId}`);
+  }
+  const run = {
+    id: `${Date.now()}:${++activeRunSeq}`,
+    config,
+    sessionKey,
+    target,
+    senderId,
+    runId: undefined,
+    startedAt: Date.now(),
+    hasForwardedOutput: false,
+    superseded: false,
+    finished: false,
+    messageCount,
+    kind,
+  };
+  activeRuns.set(sessionKey, run);
+  return run;
+}
+
+function finishActiveRun(run) {
+  run.finished = true;
+  if (activeRuns.get(run.sessionKey) === run) {
+    activeRuns.delete(run.sessionKey);
+  }
+}
+
+function isRunSuperseded(run) {
+  if (!run) return false;
+  return run.superseded || (activeRuns.get(run.sessionKey) && activeRuns.get(run.sessionKey) !== run);
+}
+
+function markRunOutputForwarded(run) {
+  if (run && !isRunSuperseded(run)) run.hasForwardedOutput = true;
+}
+
+function shouldSuppressRunOutput(config, run) {
+  return Boolean(config?.interrupt?.suppressSupersededReplies && isRunSuperseded(run));
+}
+
 function messageText(decision, message, preparedText) {
   const text = preparedText || decision.promptText || decision.text;
   if (decision.target?.kind === "group") {
@@ -379,7 +441,7 @@ async function resolveOneBotInboundFile(client, target, part) {
 
 function logPreparedInboundMedia(parts, target) {
   for (const part of parts) {
-    if (part?.kind !== "image" && part?.kind !== "file") continue;
+    if (part?.kind !== "image" && part?.kind !== "file" && part?.kind !== "video" && part?.kind !== "record") continue;
     const name = part.filename || part.file || part.fileId || "file";
     if (part.downloadStatus === "saved") {
       logger.info(`inbound ${part.kind} saved ${target.kind}:${target.id} file=${name} path=${part.localPath} size=${part.size ?? "unknown"}`);
@@ -409,6 +471,11 @@ function inboundBatchDelay(buffer) {
 }
 
 function queueInboundForDispatch(config, sessionKey, target, item) {
+  const senderId = item.senderId ?? senderKeyFromMessage(item.message);
+  if (canAcceptInterrupt(config, sessionKey, senderId)) {
+    queueInterruptForDispatch(config, sessionKey, target, { ...item, senderId });
+    return;
+  }
   let buffer = inboundBuffers.get(sessionKey);
   if (!buffer) {
     buffer = { config, sessionKey, target, firstAt: Date.now(), items: [], timer: null };
@@ -416,7 +483,7 @@ function queueInboundForDispatch(config, sessionKey, target, item) {
   }
   buffer.config = config;
   buffer.target = target;
-  buffer.items.push(item);
+  buffer.items.push({ ...item, senderId });
   if (buffer.timer) clearTimeout(buffer.timer);
   const delay = inboundBatchDelay(buffer);
   logger.debug(`queued inbound ${sessionKey} items=${buffer.items.length} delay_ms=${delay}`);
@@ -425,6 +492,65 @@ function queueInboundForDispatch(config, sessionKey, target, item) {
       logger.error(`flush inbound failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
     });
   }, delay);
+}
+
+function queueInterruptForDispatch(config, sessionKey, target, item) {
+  let buffer = interruptBuffers.get(sessionKey);
+  if (!buffer) {
+    buffer = { config, sessionKey, target, senderId: item.senderId, firstAt: Date.now(), items: [], timer: null };
+    interruptBuffers.set(sessionKey, buffer);
+  }
+  buffer.config = config;
+  buffer.target = target;
+  buffer.senderId = item.senderId;
+  buffer.items.push(item);
+  if (buffer.items.length > config.interrupt.maxBufferedMessages) {
+    buffer.items.splice(0, buffer.items.length - config.interrupt.maxBufferedMessages);
+  }
+  if (buffer.timer) clearTimeout(buffer.timer);
+  const delay = Math.max(0, config.interrupt.debounceMs);
+  logger.info(`queued interrupt ${sessionKey} items=${buffer.items.length} delay_ms=${delay}`);
+  buffer.timer = setTimeout(() => {
+    void flushInterruptBuffer(sessionKey).catch((error) => {
+      logger.error(`flush interrupt failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+    });
+  }, delay);
+}
+
+async function flushInterruptBuffer(sessionKey) {
+  const buffer = interruptBuffers.get(sessionKey);
+  if (!buffer) return;
+  interruptBuffers.delete(sessionKey);
+  if (buffer.timer) clearTimeout(buffer.timer);
+
+  const text = buffer.items
+    .map((item) => messageText(item.decision, item.message, item.preparedText))
+    .filter((item) => item && item.trim())
+    .join("\n")
+    .trim();
+  if (!text) return;
+
+  const active = activeRunFor(sessionKey);
+  if (!canInterruptRun(buffer.config, active, buffer.senderId)) {
+    logger.debug(`interrupt expired; dispatching as normal ${sessionKey}`);
+    await enqueueSession(sessionKey, () => runOneBotTurn(buffer.config, buffer.target, sessionKey, text, buffer.items.length, buffer.senderId, "normal-after-expired-interrupt"));
+    return;
+  }
+
+  active.superseded = true;
+  const oldRunId = active.runId;
+  logger.warn(`interrupting active run ${sessionKey} old_run=${oldRunId ?? "pending"} messages=${buffer.items.length}`);
+  if (oldRunId) {
+    try {
+      await abortOpenClawRun(sessionKey, oldRunId);
+      logger.warn(`aborted superseded run=${oldRunId} for ${sessionKey}`);
+    } catch (error) {
+      logger.warn(`abort superseded run failed for ${sessionKey} run=${oldRunId}: ${error.message || String(error)}`);
+    }
+  }
+
+  const guidance = formatInterruptGuidance([text]);
+  await runOneBotTurn(buffer.config, buffer.target, sessionKey, guidance, buffer.items.length, buffer.senderId, "interrupt");
 }
 
 async function flushInboundBuffer(sessionKey) {
@@ -439,14 +565,34 @@ async function flushInboundBuffer(sessionKey) {
     .trim();
   if (!text) return;
   await enqueueSession(sessionKey, async () => {
-    const beforeFile = getSessionFile(sessionKey);
-    const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
-    const startedAt = Date.now();
-    logger.info(`dispatch ${sessionKey} target=${buffer.target.kind}:${buffer.target.id} messages=${buffer.items.length}`);
-    const result = await dispatchToOpenClaw(sessionKey, text);
-    logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"}`);
-    await waitAndForwardAssistant(buffer.config, buffer.target, sessionKey, beforeFile, beforeCursor, startedAt, result?.runId);
+    const senderId = buffer.items[buffer.items.length - 1]?.senderId ?? senderKeyFromMessage(buffer.items[buffer.items.length - 1]?.message);
+    await runOneBotTurn(buffer.config, buffer.target, sessionKey, text, buffer.items.length, senderId, "normal");
   });
+}
+
+async function runOneBotTurn(config, target, sessionKey, text, messageCount, senderId, kind) {
+  const beforeFile = getSessionFile(sessionKey);
+  const beforeCursor = beforeFile ? fileSize(beforeFile) : 0;
+  const activeRun = startActiveRun(config, sessionKey, target, senderId, messageCount, kind);
+  const startedAt = activeRun.startedAt;
+  logger.info(`dispatch ${sessionKey} target=${target.kind}:${target.id} messages=${messageCount} kind=${kind}`);
+  try {
+    const result = await dispatchToOpenClaw(sessionKey, text);
+    activeRun.runId = result?.runId;
+    logger.info(`sessions.send ${sessionKey} run=${result?.runId ?? "unknown"} kind=${kind}`);
+    if (activeRun.superseded && result?.runId) {
+      try {
+        await abortOpenClawRun(sessionKey, result.runId);
+        logger.warn(`aborted late-known superseded run=${result.runId} for ${sessionKey}`);
+      } catch (error) {
+        logger.warn(`abort late-known superseded run failed for ${sessionKey} run=${result.runId}: ${error.message || String(error)}`);
+      }
+      return;
+    }
+    await waitAndForwardAssistant(config, target, sessionKey, beforeFile, beforeCursor, startedAt, result?.runId, activeRun);
+  } finally {
+    finishActiveRun(activeRun);
+  }
 }
 
 async function dispatchToOpenClaw(sessionKey, text) {
@@ -508,14 +654,20 @@ async function sendToolResultEntry(config, target, entry) {
   return sender.sent.length > 0;
 }
 
-async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
+async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label, activeRun) {
   const pendingFinal = getPendingFinalDelivery(sessionKey, startedAt);
   if (!pendingFinal) return false;
   const deliveredIds = deliveredAssistantIds(sessionKey);
   if (deliveredIds.has(pendingFinal.id)) return true;
+  if (shouldSuppressRunOutput(config, activeRun)) {
+    deliveredIds.add(pendingFinal.id);
+    logger.info(`suppressed pending final for superseded run ${sessionKey}${label ? ` ${label}` : ""}`);
+    return true;
+  }
   deliveredIds.add(pendingFinal.id);
   try {
     await sendAssistantText(config, target, pendingFinal.text);
+    markRunOutputForwarded(activeRun);
   } catch (error) {
     deliveredIds.delete(pendingFinal.id);
     throw error;
@@ -524,19 +676,24 @@ async function forwardPendingFinalDelivery(config, target, sessionKey, startedAt
   return true;
 }
 
-async function waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, label) {
+async function waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, label, activeRun) {
   const deadline = Date.now() + PENDING_FINAL_WAIT_MS;
   do {
-    if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label)) return true;
+    if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, label, activeRun)) return true;
     await sleep(250);
   } while (Date.now() < deadline);
   return false;
 }
 
-async function sendNoAssistantFallback(config, target, sessionKey, runId, reason) {
+async function sendNoAssistantFallback(config, target, sessionKey, runId, reason, activeRun) {
+  if (shouldSuppressRunOutput(config, activeRun)) {
+    logger.info(`suppressed fallback for superseded run ${sessionKey} run=${runId ?? "unknown"}`);
+    return true;
+  }
   const shortRun = runId ? String(runId).slice(0, 8) : "unknown";
   const text = `OpenClaw \u672c\u8f6e\u6ca1\u6709\u751f\u6210\u53ef\u53d1\u9001\u56de\u590d\uff0c\u5df2\u4e2d\u6b62\u3002\u539f\u56e0\uff1a${reason}\u3002run=${shortRun}`;
   await sendAssistantText(config, target, text);
+  markRunOutputForwarded(activeRun);
   logger.warn(`sent empty assistant fallback for ${sessionKey} run=${shortRun} reason=${reason}`);
   return true;
 }
@@ -592,7 +749,7 @@ function entryStableId(entry) {
     : `${entry.timestamp || ""}:${role}:${content.slice(0, 160)}`;
 }
 
-async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, initialCursor, startedAt, runId) {
+async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, initialCursor, startedAt, runId, activeRun) {
   let cursor = initialCursor;
   let file = sessionFile;
   let trajectoryFile = trajectoryFileForSessionFile(file);
@@ -608,6 +765,10 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   const maxDeadline = startedAt + ASSISTANT_MAX_WAIT_MS;
 
   const processEntries = async (entries, source) => {
+    if (shouldSuppressRunOutput(config, activeRun)) {
+      logger.info(`stopped reading superseded run ${sessionKey} run=${runId ?? "unknown"}`);
+      return;
+    }
     for (const entry of entries) {
       const stableId = entryStableId(entry);
       if (entryShowsRunProgress(entry, startedAt) && !progressIds.has(stableId)) {
@@ -619,9 +780,14 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
       const ts = Date.parse(entry.timestamp || "");
       if (Number.isFinite(ts) && ts + 1000 < startedAt) continue;
       if (!hasVisibleAssistantPayload(entry.message)) continue;
+      if (shouldSuppressRunOutput(config, activeRun)) {
+        logger.info(`suppressed assistant message from superseded run ${sessionKey} run=${runId ?? "unknown"}`);
+        return;
+      }
       deliveredIds.add(stableId);
       try {
         await sendAssistantEntry(config, target, entry);
+        markRunOutputForwarded(activeRun);
       } catch (error) {
         deliveredIds.delete(stableId);
         throw error;
@@ -633,6 +799,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   };
 
   while (Date.now() < maxDeadline) {
+    if (shouldSuppressRunOutput(config, activeRun)) return true;
     const mappedFile = getSessionFile(sessionKey);
     if (mappedFile && mappedFile !== file) {
       logger.info(`session file switched for ${sessionKey}: ${file || "none"} -> ${mappedFile}`);
@@ -664,10 +831,15 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
           const toolResultIds = deliveredToolResultIds(sessionKey);
           const toolResultId = `tool-result:${runId || "unknown"}:${stableId}`;
           if (!toolResultIds.has(toolResultId)) {
+            if (shouldSuppressRunOutput(config, activeRun)) {
+              logger.info(`stopped reading tool result for superseded run ${sessionKey} run=${runId ?? "unknown"}`);
+              return true;
+            }
             toolResultIds.add(toolResultId);
             try {
               const forwarded = await sendToolResultEntry(config, target, entry);
               if (forwarded) {
+                markRunOutputForwarded(activeRun);
                 sentToolOutput = true;
                 lastProgressAt = Date.now();
                 logger.info(`forwarded tool result media ${toolResultId} to ${target.kind}:${target.id}`);
@@ -684,7 +856,7 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     if (!sentAny && file && Date.now() - lastCatchupScanAt >= ASSISTANT_CATCHUP_SCAN_MS) {
       lastCatchupScanAt = Date.now();
       await processEntries(readAllEntries(file), "catchup");
-      if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "via catchup")) {
+      if (await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "via catchup", activeRun)) {
         sentAny = true;
         lastSentAt = Date.now();
       }
@@ -697,9 +869,10 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
   if (!sentAny) {
     if (file) await processEntries(readAllEntries(file), "final-catchup");
     if (sentAny) return true;
-    if (!sentToolOutput && await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort")) return true;
+    if (!sentToolOutput && await forwardPendingFinalDelivery(config, target, sessionKey, startedAt, "before timeout abort", activeRun)) return true;
   }
   if (!sentAny && runId && !yieldDetected) {
+    if (shouldSuppressRunOutput(config, activeRun)) return true;
     const waitedMs = Date.now() - startedAt;
     const idleMs = Date.now() - lastProgressAt;
     logger.warn(`assistant timeout for ${sessionKey}; aborting run=${runId} waited_ms=${waitedMs} idle_ms=${idleMs}`);
@@ -709,12 +882,13 @@ async function waitAndForwardAssistant(config, target, sessionKey, sessionFile, 
     } catch (error) {
       logger.warn(`abort timed out run failed for ${sessionKey}: ${error.message || String(error)}`);
     }
-    if (!sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort")) return true;
-    if (!sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output");
+    if (!sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout abort", activeRun)) return true;
+    if (!sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output", activeRun);
   } else {
     logger.warn(`assistant timeout for ${sessionKey}${yieldDetected ? " after yielded wait" : ""}`);
-    if (!sentAny && !sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout")) return true;
-    if (!sentAny && !sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output");
+    if (shouldSuppressRunOutput(config, activeRun)) return true;
+    if (!sentAny && !sentToolOutput && await waitAndForwardPendingFinalDelivery(config, target, sessionKey, startedAt, "after timeout", activeRun)) return true;
+    if (!sentAny && !sentToolOutput) return sendNoAssistantFallback(config, target, sessionKey, runId, "timeout/no assistant output", activeRun);
   }
   return sentAny || sentToolOutput;
 }
@@ -745,8 +919,7 @@ async function catchUpOrphanedOneBotSessions(config) {
         await sendAssistantEntry(config, target, entry);
         logger.info(`orphan catchup forwarded assistant message ${entry.id ?? stableId} to ${target.kind}:${target.id}`);
       } catch (error) {
-        deliveredIds.delete(stableId);
-        logger.error(`orphan catchup failed for ${sessionKey}: ${error.stack || error.message || String(error)}`);
+        logger.error(`orphan catchup failed for ${sessionKey}; not retrying in this process: ${error.stack || error.message || String(error)}`);
       }
     }
     const pendingCreatedAt = Number(meta?.pendingFinalDeliveryCreatedAt ?? 0);
@@ -774,15 +947,30 @@ async function handleOneBotMessage(message) {
   if (deduper.isDuplicate(message)) return;
   const config = loadHookConfig();
   const decision = decideInbound(config, message);
-  if (!decision.forward || !decision.target) {
+  if (!decision.target) {
     logger.debug(`inbound ignored: ${decision.reason}`);
     return;
   }
 
   const target = decision.target;
   const sessionKey = buildSessionKey(AGENT_ID, target);
+  const senderId = senderKeyFromMessage(message);
+  const acceptInterruptFollowup =
+    !decision.forward &&
+    decision.reason === "group-not-triggered" &&
+    canAcceptInterrupt(config, sessionKey, senderId);
+  if (!decision.forward && !acceptInterruptFollowup) {
+    logger.debug(`inbound ignored: ${decision.reason}`);
+    return;
+  }
+
   const preparedText = await prepareInboundPromptText(config, decision, message, target);
-  queueInboundForDispatch(config, sessionKey, target, { decision, message, preparedText });
+  const item = { decision, message, preparedText, senderId };
+  if (acceptInterruptFollowup) {
+    queueInterruptForDispatch(config, sessionKey, target, item);
+  } else {
+    queueInboundForDispatch(config, sessionKey, target, item);
+  }
 }
 
 async function connectOneBot() {
@@ -831,7 +1019,11 @@ process.on("SIGTERM", () => {
   for (const buffer of inboundBuffers.values()) {
     if (buffer.timer) clearTimeout(buffer.timer);
   }
+  for (const buffer of interruptBuffers.values()) {
+    if (buffer.timer) clearTimeout(buffer.timer);
+  }
   inboundBuffers.clear();
+  interruptBuffers.clear();
   void currentClient?.stop?.().finally(() => process.exit(0));
 });
 process.on("SIGINT", () => {
@@ -841,7 +1033,11 @@ process.on("SIGINT", () => {
   for (const buffer of inboundBuffers.values()) {
     if (buffer.timer) clearTimeout(buffer.timer);
   }
+  for (const buffer of interruptBuffers.values()) {
+    if (buffer.timer) clearTimeout(buffer.timer);
+  }
   inboundBuffers.clear();
+  interruptBuffers.clear();
   void currentClient?.stop?.().finally(() => process.exit(0));
 });
 

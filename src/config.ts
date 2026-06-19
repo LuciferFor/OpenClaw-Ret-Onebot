@@ -1,4 +1,13 @@
-import type { OneBotFileConfig, OneBotFilePathMapping, OneBotHookConfig, OneBotMediaConfig, OneBotReplyConfig, OneBotTriggerConfig, OneBotWsConfig } from "./types.js";
+import type {
+  OneBotFileConfig,
+  OneBotFilePathMapping,
+  OneBotHookConfig,
+  OneBotInterruptConfig,
+  OneBotMediaConfig,
+  OneBotReplyConfig,
+  OneBotTriggerConfig,
+  OneBotWsConfig,
+} from "./types.js";
 
 const DEFAULT_WS_PATH = "/onebot/v11/ws";
 
@@ -91,6 +100,19 @@ function normalizeFileConfig(raw: any): OneBotFileConfig {
   };
 }
 
+function normalizeInterruptConfig(raw: any): OneBotInterruptConfig {
+  return {
+    enabled: raw?.enabled === undefined ? true : Boolean(raw.enabled),
+    mode: "abort_and_resend",
+    sameSenderOnly: raw?.sameSenderOnly === undefined ? true : Boolean(raw.sameSenderOnly),
+    debounceMs: asNumber(raw?.debounceMs, 800, 0, 30_000),
+    followupWindowMs: asNumber(raw?.followupWindowMs, 120_000, 1_000, 60 * 60_000),
+    maxBufferedMessages: asNumber(raw?.maxBufferedMessages, 8, 1, 100),
+    suppressSupersededReplies: raw?.suppressSupersededReplies === undefined ? true : Boolean(raw.suppressSupersededReplies),
+    interruptAfterOutput: raw?.interruptAfterOutput === undefined ? false : Boolean(raw.interruptAfterOutput),
+  };
+}
+
 export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): OneBotHookConfig | null {
   const root = apiOrConfig?.config ?? apiOrConfig ?? {};
   const channel = root?.channels?.onebot;
@@ -111,6 +133,7 @@ export function getOneBotHookConfig(apiOrConfig: any, accountId = "default"): On
     reply: normalizeReplyConfig(raw.reply),
     media: normalizeMediaConfig(raw.media),
     files: normalizeFileConfig(raw.files),
+    interrupt: normalizeInterruptConfig(raw.interrupt),
   };
 }
 

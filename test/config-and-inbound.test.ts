@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getOneBotHookConfig } from "../src/config.js";
 import { decideInbound, buildSessionKey, extractMessageText, isMentioned } from "../src/inbound.js";
 import { extractInboundParts, partsToText } from "../src/media.js";
 import type { OneBotHookConfig, OneBotMessageEvent } from "../src/types.js";
@@ -45,11 +46,36 @@ function config(overrides: Partial<OneBotHookConfig> = {}): OneBotHookConfig {
       pathMappings: [{ from: "/home/lucifer/.openclaw/workspace", to: "/home/node/.openclaw/workspace" }],
       fallbackOnFailure: "text",
     },
+    interrupt: {
+      enabled: true,
+      mode: "abort_and_resend",
+      sameSenderOnly: true,
+      debounceMs: 800,
+      followupWindowMs: 120_000,
+      maxBufferedMessages: 8,
+      suppressSupersededReplies: true,
+      interruptAfterOutput: false,
+    },
     ...overrides,
   };
 }
 
 describe("inbound decisions", () => {
+  it("normalizes interrupt defaults", () => {
+    const cfg = getOneBotHookConfig({ channels: { onebot: { ws: { url: "ws://127.0.0.1:3001" } } } });
+
+    expect(cfg?.interrupt).toEqual({
+      enabled: true,
+      mode: "abort_and_resend",
+      sameSenderOnly: true,
+      debounceMs: 800,
+      followupWindowMs: 120_000,
+      maxBufferedMessages: 8,
+      suppressSupersededReplies: true,
+      interruptAfterOutput: false,
+    });
+  });
+
   it("forwards all private text messages by default", () => {
     const message: OneBotMessageEvent = {
       post_type: "message",

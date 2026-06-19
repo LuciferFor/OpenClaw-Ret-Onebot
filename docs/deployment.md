@@ -14,6 +14,7 @@
 - 出站文件默认开启：结构化 `file/path/fileUrl` 和 assistant 文本里的 allowlist 本地路径会走 OneBot `upload_private_file` / `upload_group_file`；默认上限 4GiB，失败时发路径、大小和原因文本。
 - 出站图片支持 OpenClaw/agent 文本里的 `<qqmedia>本地图片路径或URL</qqmedia>` 占位；hook 会剥掉标签并转 OneBot `image` segment。本地图片会先读成 `base64://...` 再发，避免 NapCat 对 `file://` 或容器/宿主路径权限不稳定导致 `rich media transfer failed`。
 - 入站文件默认开启：OneBot `file` segment 会优先使用事件 URL，其次尝试 `get_private_file_url` / `get_group_file_url` / `get_file`，保存到 `~/.openclaw/workspace/incoming/onebot-files`，并把真实路径写入 OpenClaw `FilePath`、`FilePaths` 和 prompt 的 `[path: ...]` 行。
+- 同会话中断默认开启：同一 QQ 会话、同一发送者在 OpenClaw 尚未向 QQ 输出前继续发消息时，sidecar 会 `sessions.abort` 旧 run，并用固定“追加/更正”引导重新 `sessions.send`。群聊第一条仍必须 @ 或关键词触发；活跃窗口内同发送者未 @ 的补充才会被接收，其他群消息仍沉默。
 - 插件进程内 service 默认不连接 OneBot，避免和 sidecar 双路回复；只有显式设置 `ONEBOT_HOOK_INPROCESS_SERVICE=1` 才启用。
 
 ## 部署脚本
@@ -168,7 +169,7 @@ ss -tnp 2>/dev/null | grep -E ':(3001|3002|18789)' || true
 - `3002` 是旧 group filter 的单连接代理，旧 channel 和 sidecar 同时连接会互相顶；sidecar 已改为 `ONEBOT_SIDECAR_WS_URL=ws://127.0.0.1:3001` 直连 NapCat。
 - 2026-06-06 18:01 与 21:00 的私聊触发了 Bash/Cron 工具，但工具结果刚写入时撞上 60 秒超时，run 被 sidecar abort，导致没有 final 回复。当前 sidecar 已改成“先读取 session 再判断超时”的无进展等待，默认 180 秒无进展、最长 10 分钟，工具仍在进展时不会立刻 abort。
 - 2026-06-06 23:47 与 23:51 的群聊 OpenClaw 已经写出 assistant，但 sidecar 增量 cursor 没读到，最终误判超时。当前 sidecar 增加每 3 秒 catch-up 扫描当前 session 文件，发现 startedAt 之后的 assistant 会补发。
-- 2026-06-07 14:00 的连续私聊里，OpenClaw reset/切换了 session 文件，sidecar 仍盯旧文件导致第一条有 OpenClaw 回复但 QQ 没收到；第二条被同会话队列压到第一条超时后才送入 OpenClaw。当前 sidecar 会动态刷新 session 文件路径，并且同会话只串行 `sessions.send`，不再把后续入站消息卡到上一轮回复等待结束之后。
+- 2026-06-07 14:00 的连续私聊里，OpenClaw reset/切换了 session 文件，sidecar 仍盯旧文件导致第一条有 OpenClaw 回复但 QQ 没收到；第二条被同会话队列压到第一条超时后才送入 OpenClaw。当前 sidecar 会动态刷新 session 文件路径；同发送者更正消息会在尚未输出时中断旧 run 并重投引导，不表示同一 OpenClaw session 允许多个模型 run 并发写同一上下文。
 - 2026-06-07 14:15 的 zip 附件只在 OpenClaw 文本里显示路径，没有发到 QQ。当前 hook 已支持文件上传，文本中 allowlist 路径如 `/home/lucifer/.openclaw/workspace/out/*.zip` 会被识别并上传；上传失败会发文本兜底。
 - 2026-06-07 15:40 的 QQ zip 入站只变成 `[file: xxx.zip]` 占位，OpenClaw 拿不到内容。当前 hook 已支持入站文件下载落盘，成功后 OpenClaw 会看到 `/home/.../.openclaw/workspace/incoming/onebot-files/...zip`。
 - 2026-06-07 17:34 的 B 站视频下载请求仍在持续写 `*.trajectory.jsonl` 工具进度，但旧 sidecar 只盯 session JSONL，180 秒未见 assistant 后误判 idle 并 abort run，最终 QQ 没收到回复。当前 sidecar 同时监听 session trajectory 的 `tool.*` / `model.*` / `session.*` 事件，并会补发 `pendingFinalDeliveryText`。
